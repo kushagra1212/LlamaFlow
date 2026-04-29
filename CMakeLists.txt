@@ -49,6 +49,11 @@ set(SOURCES
     ${IMGUI_DIR}/backends/imgui_impl_opengl3.cpp
 )
 
+if(APPLE)
+    list(APPEND SOURCES mac_icon.mm)
+    set_source_files_properties(mac_icon.mm PROPERTIES COMPILE_FLAGS "-x objective-c++")
+endif()
+
 add_executable(${PROJECT_NAME} ${SOURCES})
 
 # --- 4. Include directories ---

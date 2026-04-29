@@ -13,6 +13,40 @@
 
 #include <cstdio>
 
+#define STB_IMAGE_IMPLEMENTATION
+#include "stb_image.h"
+#include "logo_png.h"
+
+#ifdef __APPLE__
+extern "C" void SetMacDockIcon(const unsigned char* png_data, unsigned int len);
+#endif
+
+// ============================================================
+//  Helper: load embedded logo PNG into OpenGL texture
+// ============================================================
+static GLuint LoadEmbeddedLogoTexture(int* out_width, int* out_height) {
+    int w, h, channels;
+    unsigned char* data = stbi_load_from_memory(
+        _Users_apple_code_per_LlamaFlow_logo_png,
+        _Users_apple_code_per_LlamaFlow_logo_png_len,
+        &w, &h, &channels, 4);
+    if (!data)
+        return 0;
+
+    GLuint tex;
+    glGenTextures(1, &tex);
+    glBindTexture(GL_TEXTURE_2D, tex);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, w, h, 0, GL_RGBA, GL_UNSIGNED_BYTE, data);
+    glBindTexture(GL_TEXTURE_2D, 0);
+    stbi_image_free(data);
+
+    if (out_width) *out_width = w;
+    if (out_height) *out_height = h;
+    return tex;
+}
+
 // ============================================================
 //  Helper: std::string with ImGui InputText
 // ============================================================
@@ -411,6 +445,13 @@ int main() {
     ImGui_ImplGlfw_InitForOpenGL(window, true);
     ImGui_ImplOpenGL3_Init("#version 150");
 
+    int logo_w = 0, logo_h = 0;
+    GLuint logo_tex = LoadEmbeddedLogoTexture(&logo_w, &logo_h);
+
+#ifdef __APPLE__
+    SetMacDockIcon(_Users_apple_code_per_LlamaFlow_logo_png, _Users_apple_code_per_LlamaFlow_logo_png_len);
+#endif
+
     LlamaManager manager;
     manager.load_configs();
     manager.attach_all();   // auto-detect externally-running servers
@@ -443,6 +484,17 @@ int main() {
         //  LEFT SIDEBAR: CONFIGURATION LIST
         // ============================================================
         ImGui::BeginChild("Sidebar", ImVec2(320, -30), true);
+
+        // Logo at top of sidebar
+        if (logo_tex) {
+            float display_w = 64.0f;
+            float aspect = logo_h ? (float)logo_w / (float)logo_h : 1.0f;
+            float display_h = display_w / aspect;
+            float offset_x = (ImGui::GetContentRegionAvail().x - display_w) * 0.5f;
+            ImGui::SetCursorPosX(ImGui::GetCursorPosX() + offset_x);
+            ImGui::Image((ImTextureID)(uintptr_t)logo_tex, ImVec2(display_w, display_h));
+            ImGui::Spacing();
+        }
         
         ImGui::TextDisabled("SAVED MODELS");
         ImGui::Spacing();
@@ -894,6 +946,9 @@ int main() {
         ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
         glfwSwapBuffers(window);
     }
+
+    if (logo_tex)
+        glDeleteTextures(1, &logo_tex);
 
     ImGui_ImplOpenGL3_Shutdown();
     ImGui_ImplGlfw_Shutdown();
