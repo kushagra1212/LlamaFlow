@@ -95,13 +95,33 @@ Install CMake via Homebrew:
 brew install cmake
 ```
 
-### Clone & Build
+### Quick Start with Make
+
+A `Makefile` is provided for convenience. It automatically handles CMake configuration.
 
 ```bash
 # Clone the repo
 git clone https://github.com/YOUR_USERNAME/LlamaFlow.git
 cd LlamaFlow
 
+# Build the project (configures CMake if needed)
+make
+
+# Build and run immediately
+make run
+
+# Clean build artifacts
+make clean
+
+# Clean everything including downloaded dependencies
+make clean-deps
+```
+
+### Manual Build with CMake
+
+If you prefer to use CMake directly:
+
+```bash
 # Create build directory
 mkdir build && cd build
 
