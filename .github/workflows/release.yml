@@ -1,0 +1,105 @@
+name: Release
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: write
+
+jobs:
+  build-macos:
+    runs-on: macos-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install dependencies
+        run: |
+          brew install cmake create-dmg
+
+      - name: Build
+        run: |
+          mkdir -p build
+          cd build
+          cmake .. -DCMAKE_BUILD_TYPE=Release
+          cmake --build . --config Release -j$(sysctl -n hw.ncpu)
+
+      - name: Create .app bundle
+        run: |
+          APP_NAME="LlamaFlow"
+          APP_BUNDLE="${APP_NAME}.app"
+          mkdir -p "${APP_BUNDLE}/Contents/MacOS"
+          mkdir -p "${APP_BUNDLE}/Contents/Resources"
+
+          cp build/LlamaFlow "${APP_BUNDLE}/Contents/MacOS/"
+
+          # Generate .icns from logo.png
+          if [ -f logo.png ]; then
+            mkdir -p LlamaFlow.iconset
+            sips -z 16 16   logo.png --out LlamaFlow.iconset/icon_16x16.png
+            sips -z 32 32   logo.png --out LlamaFlow.iconset/icon_16x16@2x.png
+            sips -z 32 32   logo.png --out LlamaFlow.iconset/icon_32x32.png
+            sips -z 64 64   logo.png --out LlamaFlow.iconset/icon_32x32@2x.png
+            sips -z 128 128 logo.png --out LlamaFlow.iconset/icon_128x128.png
+            sips -z 256 256 logo.png --out LlamaFlow.iconset/icon_128x128@2x.png
+            sips -z 256 256 logo.png --out LlamaFlow.iconset/icon_256x256.png
+            sips -z 512 512 logo.png --out LlamaFlow.iconset/icon_256x256@2x.png
+            sips -z 512 512 logo.png --out LlamaFlow.iconset/icon_512x512.png
+            cp logo.png LlamaFlow.iconset/icon_512x512@2x.png
+            iconutil -c icns LlamaFlow.iconset -o "${APP_BUNDLE}/Contents/Resources/${APP_NAME}.icns"
+            rm -rf LlamaFlow.iconset
+          fi
+
+          cat > "${APP_BUNDLE}/Contents/Info.plist" << 'EOF'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>CFBundleExecutable</key>
+            <string>LlamaFlow</string>
+            <key>CFBundleIdentifier</key>
+            <string>com.llamaflow.app</string>
+            <key>CFBundleName</key>
+            <string>LlamaFlow</string>
+            <key>CFBundleDisplayName</key>
+            <string>LlamaFlow Orchestrator</string>
+            <key>CFBundlePackageType</key>
+            <string>APPL</string>
+            <key>CFBundleShortVersionString</key>
+            <string>${{ github.ref_name }}</string>
+            <key>CFBundleVersion</key>
+            <string>${{ github.ref_name }}</string>
+            <key>LSMinimumSystemVersion</key>
+            <string>10.14</string>
+            <key>CFBundleIconFile</key>
+            <string>LlamaFlow</string>
+            <key>NSHighResolutionCapable</key>
+            <true/>
+          </dict>
+          </plist>
+          EOF
+
+          chmod +x "${APP_BUNDLE}/Contents/MacOS/LlamaFlow"
+
+      - name: Create .dmg
+        run: |
+          create-dmg \
+            --volname "LlamaFlow" \
+            --window-pos 200 120 \
+            --window-size 800 400 \
+            --icon-size 100 \
+            --app-drop-link 600 185 \
+            --icon "LlamaFlow.app" 200 185 \
+            "LlamaFlow-${{ github.ref_name }}-macOS.dmg" \
+            "LlamaFlow.app"
+
+      - name: Upload Release Asset
+        uses: softprops/action-gh-release@v2
+        with:
+          files: LlamaFlow-${{ github.ref_name }}-macOS.dmg
+          tag_name: ${{ github.ref_name }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
