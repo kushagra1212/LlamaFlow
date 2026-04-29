@@ -31,6 +31,15 @@ LlamaFlow gives you a visual control panel for your local LLM servers. Launch mo
 4. Launch LlamaFlow from Launchpad or Spotlight.
 
 > **Note:** On first launch, macOS may warn that the app is from an unidentified developer. Go to **System Settings → Privacy & Security** and click **Open Anyway**.
+>
+> **"LlamaFlow is damaged and can't be opened"**: This is a Gatekeeper quarantine issue, not actual file corruption. The app is unsigned, so macOS flags downloaded files. Run this in Terminal to remove the quarantine flag:
+> ```bash
+> xattr -cr /Applications/LlamaFlow.app
+> ```
+> Then relaunch the app. You can also remove the flag from the `.dmg` before extracting:
+> ```bash
+> xattr -cr ~/Downloads/LlamaFlow-*.dmg
+> ```
 
 ### Option 2: Build from Source
 
@@ -70,9 +79,17 @@ See the [Developer Guide](#developer-guide) below.
 
 - Click **Stop** inside the active model tab to gracefully shut down the server.
 
-### Configuration File
+### Where Is My Data Stored?
 
-All saved configs are stored in `configs.json` in the same directory as the executable. You can edit this file directly if needed.
+LlamaFlow saves your model configurations in a file called `configs.json`. Its location depends on how you run the app:
+
+| How you run LlamaFlow | Where `configs.json` lives |
+|---|---|
+| `.app` in `/Applications` | `/Applications/LlamaFlow.app/Contents/Resources/configs.json` |
+| Run from build directory | `build/configs.json` (next to the `LlamaFlow` binary) |
+| Run via `make run` | `build/configs.json` |
+
+You can open or edit this file directly in any text editor. It is a standard JSON file. Keep a backup if you manually edit it, since invalid JSON will be reset on next launch.
 
 ---
 
