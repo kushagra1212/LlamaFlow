@@ -1,10 +1,10 @@
 # LlamaFlow
 
-> A lightweight, native macOS desktop orchestrator for managing and monitoring [llama.cpp](https://github.com/ggerganov/llama.cpp) server instances in real time.
+> A lightweight, native macOS desktop orchestrator for managing and monitoring [llama.cpp](https://github.com/ggerganov/llama.cpp) server instances.
 
 LlamaFlow gives you a visual control panel for your local LLM servers. Launch models, watch live throughput metrics, inspect server logs, and shut down instances — all from a clean, minimal interface built with Dear ImGui and OpenGL.
 
-![LlamaFlow Screenshot](screenshot.png)
+<img width="1477" height="928" alt="Screenshot 2026-04-29 at 10 52 07 PM" src="https://github.com/user-attachments/assets/b43ec7da-53b2-4ba3-b5ad-f18aaaf4e294" />
 
 ---
 
