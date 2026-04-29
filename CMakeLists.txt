@@ -52,13 +52,16 @@ set(SOURCES
 add_executable(${PROJECT_NAME} ${SOURCES})
 
 # --- 4. Include directories ---
-target_include_directories(${PROJECT_NAME} PRIVATE 
-    ${IMGUI_DIR} 
-    ${IMGUI_DIR}/backends 
+target_include_directories(${PROJECT_NAME} PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${IMGUI_DIR}
+    ${IMGUI_DIR}/backends
     ${JSON_DIR}
 )
 
 # --- 5. Link libraries ---
+find_package(Threads REQUIRED)
+
 if(APPLE)
     find_library(COCOA_FRAMEWORK Cocoa)
     find_library(OPENGL_FRAMEWORK OpenGL)
@@ -68,11 +71,12 @@ if(APPLE)
     # We now link to the target created by FetchContent, not a system library
     target_link_libraries(${PROJECT_NAME} PRIVATE 
         glfw 
+        Threads::Threads
         ${COCOA_FRAMEWORK} 
         ${OPENGL_FRAMEWORK} 
         ${IOKIT_FRAMEWORK} 
         ${COREVIDEO_FRAMEWORK}
     )
 else()
-    target_link_libraries(${PROJECT_NAME} PRIVATE glfw)
+    target_link_libraries(${PROJECT_NAME} PRIVATE glfw Threads::Threads)
 endif()
