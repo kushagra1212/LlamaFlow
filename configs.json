@@ -5,5 +5,12 @@
         "model_path": "~/.cache/huggingface/hub/models--unsloth--Qwen3.6-35B-A3B-GGUF/snapshots/a483e9e6cbd595906af30beda3187c2663a1118c/Qwen3.6-35B-A3B-UD-IQ3_XXS.gguf",
         "name": "Qwen3.6-35B-A3B",
         "port": 34567
+    },
+    {
+        "custom_args": "--embedding --pooling mean --port 8080",
+        "exec_path": "/Users/apple/code/per/llama.cpp/build/bin/llama-server",
+        "model_path": "/Users/apple/.cache/huggingface/hub/models--unsloth--Qwen3-0.6B-GGUF/snapshots/50968a4468ef4233ed78cd7c3de230dd1d61a56b/Qwen3-0.6B-UD-Q4_K_XL.gguf",
+        "name": "Qwen3-0.6B-embedding",
+        "port": 8080
     }
 ]

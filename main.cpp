@@ -90,12 +90,12 @@ static std::string format_duration(double seconds) {
     return buf;
 }
 
-/** Colored scrolling view of llama-server logs (shown in MODEL TERMINAL pane). */
+/** Colored scrolling view of llama-server logs (shown in active-models terminal pane). */
 static void UiDrawServerLogViewport(ServerInstance* srv) {
     if (!srv)
         return;
 
-    ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.05f, 0.05f, 0.05f, 1.0f));
+    ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.04f, 0.04f, 0.06f, 1.0f));
     ImGui::BeginChild("LogViewport", ImVec2(-1, -1), false, ImGuiWindowFlags_HorizontalScrollbar);
 
     std::deque<std::string> log_snapshot = srv->get_logs();
@@ -107,6 +107,16 @@ static void UiDrawServerLogViewport(ServerInstance* srv) {
             ImGui::TextColored(ImVec4(0.3f, 0.8f, 1.0f, 1.0f), "%s", line.c_str());
         } else if (line.find("slot") != std::string::npos) {
             ImGui::TextColored(ImVec4(0.8f, 0.8f, 0.2f, 1.0f), "%s", line.c_str());
+        } else if (line.find("loaded model") != std::string::npos || line.find("model loaded") != std::string::npos) {
+            ImGui::TextColored(ImVec4(0.2f, 1.0f, 0.4f, 1.0f), "%s", line.c_str());
+        } else if (line.find("server is listening") != std::string::npos || line.find("started") != std::string::npos) {
+            ImGui::TextColored(ImVec4(0.3f, 0.9f, 0.6f, 1.0f), "%s", line.c_str());
+        } else if (line.find("warning") != std::string::npos || line.find("WARN") != std::string::npos) {
+            ImGui::TextColored(ImVec4(1.0f, 0.85f, 0.3f, 1.0f), "%s", line.c_str());
+        } else if (line.find("progress") != std::string::npos || line.find("Progress") != std::string::npos) {
+            ImGui::TextColored(ImVec4(0.6f, 0.4f, 1.0f, 1.0f), "%s", line.c_str());
+        } else if (line.find("tokens per second") != std::string::npos) {
+            ImGui::TextColored(ImVec4(0.2f, 1.0f, 0.8f, 1.0f), "%s", line.c_str());
         } else {
             ImGui::TextUnformatted(line.c_str());
         }
@@ -260,18 +270,44 @@ static void EndMetricCard() {
 // ============================================================
 //  UI: Themed progress bar with color gradient
 // ============================================================
-static void ColoredProgressBar(float fraction, const ImVec2& size, const char* overlay, 
+static void ColoredProgressBar(float fraction, const ImVec2& size_arg, const char* overlay,
                                 const ImVec4& color_low, const ImVec4& color_high) {
-    // Interpolate color based on fraction
-    ImVec4 color;
-    color.x = color_low.x + (color_high.x - color_low.x) * fraction;
-    color.y = color_low.y + (color_high.y - color_low.y) * fraction;
-    color.z = color_low.z + (color_high.z - color_low.z) * fraction;
-    color.w = 1.0f;
-    
-    ImGui::PushStyleColor(ImGuiCol_PlotHistogram, color);
-    ImGui::ProgressBar(fraction, size, overlay);
-    ImGui::PopStyleColor();
+    ImVec2 pos = ImGui::GetCursorScreenPos();
+    ImVec2 size = size_arg;
+    if (size.x <= 0) size.x = ImGui::GetContentRegionAvail().x + size.x;
+    if (size.y <= 0) size.y = ImGui::GetFontSize() + ImGui::GetStyle().FramePadding.y * 2.0f;
+
+    ImVec2 max_pos(pos.x + size.x, pos.y + size.y);
+    ImGui::Dummy(size);
+
+    // Interpolate color
+    ImVec4 col4;
+    col4.x = color_low.x + (color_high.x - color_low.x) * fraction;
+    col4.y = color_low.y + (color_high.y - color_low.y) * fraction;
+    col4.z = color_low.z + (color_high.z - color_low.z) * fraction;
+    col4.w = 1.0f;
+    ImU32 col    = ImGui::ColorConvertFloat4ToU32(col4);
+    ImU32 bg_col = ImGui::ColorConvertFloat4ToU32(ImVec4(0.12f, 0.12f, 0.15f, 1.0f));
+
+    float rounding = size.y * 0.5f;
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+
+    // Background pill
+    dl->AddRectFilled(pos, max_pos, bg_col, rounding);
+
+    // Fill pill
+    float fill_w = size.x * fraction;
+    fill_w = std::max(fill_w, rounding * 2.0f);
+    dl->AddRectFilled(pos, ImVec2(pos.x + fill_w, max_pos.y), col, rounding);
+
+    // Overlay text with shadow for readability
+    if (overlay && overlay[0]) {
+        ImVec2 text_size = ImGui::CalcTextSize(overlay);
+        float text_x = pos.x + std::max(6.0f, (size.x - text_size.x) * 0.5f);
+        ImVec2 text_pos(text_x, pos.y + (size.y - text_size.y) * 0.5f);
+        dl->AddText(ImVec2(text_pos.x + 1, text_pos.y + 1), IM_COL32(0, 0, 0, 180), overlay);
+        dl->AddText(text_pos, IM_COL32(255, 255, 255, 255), overlay);
+    }
 }
 
 // ============================================================
@@ -436,11 +472,14 @@ int main() {
         ImGui::SameLine();
 
         // ============================================================
-        //  RIGHT PANEL: sticky actions + single scroll (config + inference)
+        //  MAIN CONTENT: config editor (no active-nodes — they are in the right sidebar)
+        //  RIGHT SIDEBAR: active models panel added below if any running
         // ============================================================
-        constexpr float kModelTerminalStripPx = 312.f;
+        static float g_active_panel_width = 520.f;
+        const bool has_active = !manager.running_servers.empty();
+        const float right_w = has_active ? g_active_panel_width : 0.f;
 
-        ImGui::BeginChild("Content", ImVec2(0, -30), false);
+        ImGui::BeginChild("Content", ImVec2(-right_w, -30), false);
 
         LlamaConfig* active_cfg = nullptr;
         if (selected_config_idx >= 0 && selected_config_idx < (int)manager.saved_configs.size())
@@ -490,13 +529,8 @@ int main() {
             ImGui::Spacing();
         }
 
-        const bool has_inference_nodes = !manager.running_servers.empty();
-        const float reserve_model_terminal =
-            has_inference_nodes ? (kModelTerminalStripPx + 10.f) : 0.f;
-
-        // One vertical scroll for editor + inference; when no terminal dock, stretch to fill Content.
-        const float right_scroll_height = reserve_model_terminal > 0.f ? -reserve_model_terminal : -1.f;
-        ImGui::BeginChild("RightScroll", ImVec2(0, right_scroll_height), true);
+        // One vertical scroll for config editor; stretches to fill Content.
+        ImGui::BeginChild("RightScroll", ImVec2(0, -1), true);
 
         if (active_cfg) {
             LlamaConfig& cfg = *active_cfg;
@@ -561,301 +595,244 @@ int main() {
             ImGui::TextDisabled("Select a configuration from the sidebar to begin.");
         }
 
+
+        ImGui::EndChild(); // RightScroll
+        
+        ImGui::EndChild(); // End Content
+
         // ============================================================
-        //  ACTIVE INFERENCE NODES SECTION
+        //  RIGHT SIDEBAR: ACTIVE MODELS (separate from config editor)
         // ============================================================
-        if (!manager.running_servers.empty()) {
-            ImGui::Spacing();
-            
-            // Section header with count badge
-            ImGui::TextDisabled("ACTIVE INFERENCE NODES");
+        if (has_active) {
+            ImGui::SameLine();
+
+            // Vertical splitter handle (draggable to resize right panel)
+            ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.18f, 0.18f, 0.20f, 1.0f));
+            ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.30f, 0.30f, 0.35f, 1.0f));
+            ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.35f, 0.35f, 0.40f, 1.0f));
+            ImGui::Button("##vsplit", ImVec2(8, -30));
+            if (ImGui::IsItemActive() && ImGui::IsMouseDragging(0)) {
+                g_active_panel_width -= ImGui::GetMouseDragDelta(0).x;
+                if (g_active_panel_width < 380.f) g_active_panel_width = 380.f;
+                if (g_active_panel_width > 900.f) g_active_panel_width = 900.f;
+                ImGui::ResetMouseDragDelta(0);
+            }
+            ImGui::PopStyleColor(3);
+
+            ImGui::SameLine();
+
+            // Active models panel (no outer scrollbar — inner terminal has its own)
+            ImGui::BeginChild("ActivePanel", ImVec2(0, -30), true, ImGuiWindowFlags_NoScrollbar);
+
+            // Header with live count
+            ImGui::TextColored(ImVec4(0.2f, 0.9f, 0.3f, 1.0f), "ACTIVE MODELS");
             ImGui::SameLine();
             ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.2f, 0.8f, 0.2f, 1.0f));
-            ImGui::Text("  (%zu running)", manager.running_servers.size());
+            ImGui::TextDisabled("  (%zu running)", manager.running_servers.size());
             ImGui::PopStyleColor();
             ImGui::Spacing();
-            
-            if (ImGui::BeginTabBar("ServersTab", ImGuiTabBarFlags_FittingPolicyScroll)) {
-                for (int i = 0; i < manager.running_servers.size(); ++i) {
-                    ServerInstance* srv = manager.running_servers[i];
-                    std::string tab_name = srv->config.name + " (Port " + std::to_string(srv->config.port) + ")";
-                    
-                    // Green dot indicator in tab
-                    std::string tab_id = tab_name + "##srv" + std::to_string(i);
-                    if (ImGui::BeginTabItem(tab_id.c_str())) {
-                        inference_tab_selected = i;
 
+            // Tab bar — one tab per running server
+            if (ImGui::BeginTabBar("ActiveTabBar", ImGuiTabBarFlags_FittingPolicyScroll)) {
+                for (int i = 0; i < (int)manager.running_servers.size(); ++i) {
+                    ServerInstance* srv = manager.running_servers[i];
+                    std::string display = srv->config.name.empty()
+                        ? "Port " + std::to_string(srv->config.port)
+                        : srv->config.name;
+                    std::string tab_id = display + "##act" + std::to_string(i);
+
+                    bool is_stopping = srv->stop_requested.load();
+                    ImVec4 tab_color = is_stopping
+                        ? ImVec4(0.55f, 0.25f, 0.15f, 1.0f)
+                        : ImVec4(0.15f, 0.55f, 0.25f, 1.0f);
+
+                    ImGui::PushStyleColor(ImGuiCol_TabActive, tab_color);
+                    ImGui::PushStyleColor(ImGuiCol_TabHovered,
+                        ImVec4(tab_color.x + 0.1f, tab_color.y + 0.1f, tab_color.z + 0.1f, 1.0f));
+
+                    if (ImGui::BeginTabItem(tab_id.c_str())) {
+                        ImGui::PopStyleColor(2);
+                        inference_tab_selected = i;
                         ImGui::PushID(srv);
 
-                        // --- Stop / shutdown ---
-                        if (srv->stop_requested.load()) {
+                        ServerMetrics sm = srv->snapshot();
+
+                        // --- Status bar + stop button ---
+                        if (is_stopping) {
                             ImGui::BeginDisabled();
-                            ImGui::Button("Stopping server…", ImVec2(200, 30));
+                            ImGui::Button("Stopping...", ImVec2(120, 24));
                             ImGui::EndDisabled();
-                            char elapsed_line[128];
-                            snprintf(elapsed_line, sizeof(elapsed_line),
-                                "Elapsed %.1f s  —  unloading the model or closing listeners can take several seconds…",
-                                srv->stop_elapsed_seconds());
-                            ImGui::TextDisabled("%s", elapsed_line);
-                            const char* st = srv->shutdown_status_text();
-                            if (st && st[0]) {
-                                ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.92f, 0.82f, 0.52f, 1.0f));
-                                ImGui::TextWrapped("%s", st);
-                                ImGui::PopStyleColor();
-                            } else {
-                                ImGui::TextDisabled("Preparing shutdown...");
-                            }
-                            float pulse = static_cast<float>(std::fmod(ImGui::GetTime() * 0.9, 2.0));
-                            float frac = (pulse < 1.0f) ? pulse : (2.0f - pulse);
-                            ImGui::PushStyleColor(ImGuiCol_PlotHistogram, ImVec4(0.55f, 0.38f, 0.18f, 0.9f));
-                            ImGui::ProgressBar(frac, ImVec2(-1, 7), " ");
+                            ImGui::SameLine();
+                            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.92f, 0.82f, 0.52f, 1.0f));
+                            ImGui::TextWrapped("%s", srv->shutdown_status_text());
                             ImGui::PopStyleColor();
                         } else {
                             ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.70f, 0.20f, 0.20f, 1.0f));
                             ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.80f, 0.25f, 0.25f, 1.0f));
                             ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.60f, 0.15f, 0.15f, 1.0f));
-                            if (ImGui::Button("Stop server", ImVec2(200, 30))) {
+                            if (ImGui::Button("Stop", ImVec2(70, 24))) {
                                 ImGui::PopStyleColor(3);
                                 manager.request_stop_server(srv);
-                                ToastPush(ToastKind::Info, "Shutdown queued — this tab stays visible until the process exits.");
+                                ToastPush(ToastKind::Info, "Shutdown queued — visible until process exits.");
                             } else {
                                 ImGui::PopStyleColor(3);
                             }
                             ImGui::SameLine();
-                            ImGui::TextDisabled("Stops llama-server (including processes started outside LlamaFlow).");
-                        }
 
-                        ServerMetrics sm = srv->snapshot();
-
-                        char pid_frag[144] = "?";
-                        if (srv->process_id > 0)
-                            snprintf(pid_frag, sizeof(pid_frag), "child PID %d", srv->process_id);
-                        else if (srv->attached && srv->external_listen_pid > 0)
-                            snprintf(pid_frag, sizeof(pid_frag), "external PID %d", (int)srv->external_listen_pid);
-                        else if (srv->attached)
-                            snprintf(pid_frag, sizeof(pid_frag), "external (PID from lsof on stop)");
-
-                        char state_frag[96] = "Running";
-                        if (srv->stop_requested.load())
-                            snprintf(state_frag, sizeof(state_frag), "Stopping");
-                        else if (!sm.model_loaded)
-                            snprintf(state_frag, sizeof(state_frag), "Loading model");
-                        else
-                            snprintf(state_frag, sizeof(state_frag), "Running");
-
-                        char status_banner[896];
-                        snprintf(status_banner, sizeof(status_banner),
-                            "Status: %s  ·  %s  ·  Uptime %s%s%s",
-                            state_frag,
-                            pid_frag,
-                            format_duration(sm.uptime_seconds).c_str(),
-                            sm.context_processing ? "  ·  Prompt/context ingest active" : "",
-                            sm.eval_tps > 1.0f ? "  ·  Generating" : "");
-
-                        ImGui::Spacing();
-                        ImGui::Separator();
-                        ImGui::Spacing();
-
-                        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.88f, 0.9f, 0.93f, 1.0f));
-                        ImGui::TextWrapped("%s", status_banner);
-                        ImGui::PopStyleColor();
-                        ImGui::Dummy(ImVec2(0.f, ImGui::GetStyle().FramePadding.y + 2.f));
-
-                        ImGui::Spacing();
-                        ImGui::SetNextItemOpen(true, ImGuiCond_Once);
-                        if (ImGui::CollapsingHeader("Launch settings summary (parsed from paths + custom args)", ImGuiTreeNodeFlags_None)) {
-                            UiLaunchOverviewTable("active_node", srv->config);
+                            char state_str[64] = "Running";
+                            if (!sm.model_loaded)
+                                snprintf(state_str, sizeof(state_str), "Loading");
+                            ImGui::TextColored(ImVec4(0.3f, 0.9f, 0.4f, 1.0f), "\xe2\x97\x8f %s", state_str);
+                            ImGui::SameLine();
+                            ImGui::TextDisabled("| %s",
+                                format_duration(sm.uptime_seconds).c_str());
                         }
 
                         ImGui::Spacing();
                         ImGui::Separator();
                         ImGui::Spacing();
 
-                        // --- MODEL LOADER (only for processes spawned by LlamaFlow) ---
-                        if (srv->stop_requested.load()) {
-                            ImGui::TextDisabled("Loader hidden during shutdown.");
-                        } else if (srv->attached) {
-                            ImGui::TextDisabled(
-                                "ATTACHED NODE: LlamaFlow did not spawn this llama-server, so loader output may be missing unless "
-                                "this app started it earlier — check Activity Monitor / terminal for load progress.");
-                        } else if (!sm.model_loaded) {
-                            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 0.55f, 0.25f, 1.0f));
-                            ImGui::TextUnformatted("MODEL LOADER");
-                            ImGui::PopStyleColor();
-                            ImGui::TextWrapped("Loading tensors and building KV / context — large models can spend minutes here.");
+                        // --- Compact metrics: 2x2 grid (fits narrow panel) ---
+                        float avail_w = ImGui::GetContentRegionAvail().x;
+                        float half_w = (avail_w - 6) / 2.0f;
 
-                            char prog_overlay[96];
-                            if (sm.current_progress > 0.01f) {
-                                snprintf(prog_overlay, sizeof(prog_overlay), "Weights & context initialization — %d%%",
-                                    (int)(sm.current_progress * 100));
-                            } else {
-                                snprintf(prog_overlay, sizeof(prog_overlay),
-                                    "Waiting for first progress lines in server log...");
-                            }
-                            ColoredProgressBar(sm.current_progress, ImVec2(-1.0f, 30), prog_overlay,
-                                ImVec4(0.85f, 0.38f, 0.15f, 1.0f),
-                                ImVec4(0.15f, 0.82f, 0.45f, 1.0f));
-                            ImGui::Spacing();
-                        } else {
-                            ImGui::TextColored(ImVec4(0.35f, 0.9f, 0.45f, 1.0f), "Model ready.");
-                            ImGui::Spacing();
-                        }
+                        // Dynamic card heights based on actual content
+                        const float line_h  = ImGui::GetTextLineHeightWithSpacing();
+                        const float pad_y   = ImGui::GetStyle().WindowPadding.y;
+                        const float space_y = ImGui::GetStyle().ItemSpacing.y;
+                        auto calc_h = [&](int n_lines) {
+                            return 3.0f + space_y + line_h * n_lines + pad_y * 2.0f;
+                        };
 
-                        // --- PROMPT / CONTEXT ingestion (streaming batches into KV) ---
-                        if (!srv->stop_requested.load() && sm.context_processing) {
-                            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.42f, 0.76f, 1.0f, 1.0f));
-                            ImGui::TextUnformatted("PROMPT / CONTEXT PIPELINE");
-                            ImGui::PopStyleColor();
-                            ImGui::TextWrapped(
-                                "Matches llama-server log lines like «prompt processing progress» — embeddings + KV fills.");
-                            char ctx_overlay[96];
-                            int ctx_pct = (int)(sm.context_progress * 100);
-                            if (sm.context_total > 0) {
-                                snprintf(ctx_overlay, sizeof(ctx_overlay), "%d%% ingested (~%s prompt tokens)",
-                                    ctx_pct, format_number(sm.context_total).c_str());
-                            } else {
-                                snprintf(ctx_overlay, sizeof(ctx_overlay), "%d%% ingested", ctx_pct);
-                            }
-                            ColoredProgressBar(sm.context_progress, ImVec2(-1.0f, 28), ctx_overlay,
-                                ImVec4(0.22f, 0.42f, 0.92f, 1.0f),
-                                ImVec4(0.35f, 0.95f, 0.40f, 1.0f));
-                            ImGui::Spacing();
-                        }
+                        float row1_h = calc_h(2); // throughput + tokens: always 2 lines
+                        float rq_h   = calc_h(sm.n_slots > 0 ? 3 : 2);
+                        float sys_h  = calc_h(2);
+                        float row2_h = rq_h > sys_h ? rq_h : sys_h; // align row 2
 
-                        ImGui::Separator();
-                        ImGui::Spacing();
-
-                        // ============================================================
-                        //  METRICS DASHBOARD
-                        // ============================================================
-
-                        // --- Row 2: 4 metric cards side by side ---
-                        float card_w = (ImGui::GetContentRegionAvail().x - 24) / 4.0f;  // 3 gaps
-                        const float metric_card_height = (std::max)(158.f, ImGui::GetFontSize() * 9.5f);
-
-                        // Card 1: Throughput
-                        ImGui::BeginChild("##card_throughput", ImVec2(card_w, metric_card_height), true,
-                            ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
+                        // Row 1
+                        ImGui::BeginChild("##tp_card", ImVec2(half_w, row1_h), true, ImGuiWindowFlags_NoScrollbar);
                         {
-                            ImDrawList* draw = ImGui::GetWindowDrawList();
-                            ImVec2 p_min = ImGui::GetWindowPos();
-                            ImVec2 p_max = ImVec2(p_min.x + ImGui::GetWindowWidth(), p_min.y + 3);
-                            draw->AddRectFilled(p_min, p_max, ImColor(0.3f, 0.7f, 1.0f));
+                            ImDrawList* dl = ImGui::GetWindowDrawList();
+                            ImVec2 p0 = ImGui::GetWindowPos();
+                            dl->AddRectFilled(p0, ImVec2(p0.x + ImGui::GetWindowWidth(), p0.y + 3), ImColor(0.3f, 0.7f, 1.0f));
                             ImGui::Spacing();
                             ImGui::TextDisabled("THROUGHPUT");
-                            ImGui::Spacing();
-                            ImGui::TextColored(ImVec4(0.3f, 0.8f, 1.0f, 1.0f), "Prompt:  %.1f t/s", sm.prompt_eval_tps);
-                            ImGui::TextColored(ImVec4(0.4f, 1.0f, 0.4f, 1.0f), "Gen:    %.1f t/s", sm.eval_tps);
+                            ImGui::TextColored(ImVec4(0.3f, 0.8f, 1.0f, 1.0f), "P:%.1f  G:%.1f t/s",
+                                sm.prompt_eval_tps, sm.eval_tps);
                         }
                         ImGui::EndChild();
                         ImGui::SameLine();
-
-                        // Card 2: Token Counters
-                        ImGui::BeginChild("##card_tokens", ImVec2(card_w, metric_card_height), true,
-                            ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
+                        ImGui::BeginChild("##tk_card", ImVec2(half_w, row1_h), true, ImGuiWindowFlags_NoScrollbar);
                         {
-                            ImDrawList* draw = ImGui::GetWindowDrawList();
-                            ImVec2 p_min = ImGui::GetWindowPos();
-                            ImVec2 p_max = ImVec2(p_min.x + ImGui::GetWindowWidth(), p_min.y + 3);
-                            draw->AddRectFilled(p_min, p_max, ImColor(1.0f, 0.7f, 0.2f));
+                            ImDrawList* dl = ImGui::GetWindowDrawList();
+                            ImVec2 p0 = ImGui::GetWindowPos();
+                            dl->AddRectFilled(p0, ImVec2(p0.x + ImGui::GetWindowWidth(), p0.y + 3), ImColor(1.0f, 0.7f, 0.2f));
                             ImGui::Spacing();
                             ImGui::TextDisabled("TOKENS");
-                            ImGui::Spacing();
-                            ImGui::Text("Prompt:     %s", format_number(sm.prompt_tokens).c_str());
-                            ImGui::Text("Generated:  %s", format_number(sm.generated_tokens).c_str());
-                            ImGui::Text("Total:      %s", format_number(sm.total_tokens_processed).c_str());
+                            ImGui::Text("P:%s  G:%s", format_number(sm.prompt_tokens).c_str(),
+                                format_number(sm.generated_tokens).c_str());
                         }
                         ImGui::EndChild();
-                        ImGui::SameLine();
 
-                        // Card 3: Requests & Slots
-                        ImGui::BeginChild("##card_requests", ImVec2(card_w, metric_card_height), true,
-                            ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
+                        // Row 2
+                        ImGui::BeginChild("##rq_card", ImVec2(half_w, row2_h), true, ImGuiWindowFlags_NoScrollbar);
                         {
-                            ImDrawList* draw = ImGui::GetWindowDrawList();
-                            ImVec2 p_min = ImGui::GetWindowPos();
-                            ImVec2 p_max = ImVec2(p_min.x + ImGui::GetWindowWidth(), p_min.y + 3);
-                            draw->AddRectFilled(p_min, p_max, ImColor(0.8f, 0.3f, 0.8f));
+                            ImDrawList* dl = ImGui::GetWindowDrawList();
+                            ImVec2 p0 = ImGui::GetWindowPos();
+                            dl->AddRectFilled(p0, ImVec2(p0.x + ImGui::GetWindowWidth(), p0.y + 3), ImColor(0.8f, 0.3f, 0.8f));
                             ImGui::Spacing();
                             ImGui::TextDisabled("REQUESTS");
-                            ImGui::Spacing();
-                            ImGui::Text("Total:      %s", format_number(sm.total_requests).c_str());
-                            ImGui::Text("Completed:  %s", format_number(sm.completed_requests).c_str());
-                            // Active slots bar
-                            float slot_frac = (sm.n_slots > 0) ? (float)sm.active_slots / (float)sm.n_slots : 0.0f;
-                            char slot_buf[64];
-                            snprintf(slot_buf, sizeof(slot_buf), "Slots: %d/%d", sm.active_slots, sm.n_slots);
-                            ColoredProgressBar(slot_frac, ImVec2(-1, 16), slot_buf,
-                                ImVec4(0.2f, 0.8f, 0.2f, 1.0f),
-                                ImVec4(1.0f, 0.3f, 0.2f, 1.0f));
-                            ImGui::Dummy(ImVec2(0.f, 6.f));
+                            ImGui::Text("Done:%s", format_number(sm.completed_requests).c_str());
+                            if (sm.n_slots > 0)
+                                ImGui::Text("Slots:%d/%d", sm.active_slots, sm.n_slots);
                         }
                         ImGui::EndChild();
                         ImGui::SameLine();
-
-                        // Card 4: System Info
-                        ImGui::BeginChild("##card_system", ImVec2(card_w, metric_card_height), true,
-                            ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
+                        ImGui::BeginChild("##sys_card", ImVec2(half_w, row2_h), true, ImGuiWindowFlags_NoScrollbar);
                         {
-                            ImDrawList* draw = ImGui::GetWindowDrawList();
-                            ImVec2 p_min = ImGui::GetWindowPos();
-                            ImVec2 p_max = ImVec2(p_min.x + ImGui::GetWindowWidth(), p_min.y + 3);
-                            draw->AddRectFilled(p_min, p_max, ImColor(0.2f, 0.8f, 0.5f));
+                            ImDrawList* dl = ImGui::GetWindowDrawList();
+                            ImVec2 p0 = ImGui::GetWindowPos();
+                            dl->AddRectFilled(p0, ImVec2(p0.x + ImGui::GetWindowWidth(), p0.y + 3), ImColor(0.2f, 0.8f, 0.5f));
                             ImGui::Spacing();
                             ImGui::TextDisabled("SYSTEM");
-                            ImGui::Spacing();
-                            if (sm.model_load_seconds > 0)
-                                ImGui::Text("Load:      %.1fs", sm.model_load_seconds);
                             if (sm.model_memory_bytes > 0)
-                                ImGui::Text("VRAM:      %s", format_bytes(sm.model_memory_bytes).c_str());
-                            ImGui::Text("Port:      %d", srv->config.port);
+                                ImGui::Text("VRAM:%s", format_bytes(sm.model_memory_bytes).c_str());
+                            else
+                                ImGui::Text("Port:%d", srv->config.port);
                         }
                         ImGui::EndChild();
 
                         ImGui::Spacing();
 
-                        // --- Row 3: Extended metrics (KV cache etc.) ---
-                        if (sm.kv_cache_usage > 0.0f) {
-                            char cache_overlay[48];
-                            snprintf(cache_overlay, sizeof(cache_overlay), "KV Cache: %d%%", (int)(sm.kv_cache_usage * 100));
-                            ColoredProgressBar(sm.kv_cache_usage, ImVec2(-1, 18), cache_overlay,
-                                ImVec4(0.2f, 0.7f, 0.3f, 1.0f),
-                                ImVec4(1.0f, 0.2f, 0.2f, 1.0f));
+                        // --- Model loader / context progress (compact) ---
+                        if (!is_stopping) {
+                            if (!sm.model_loaded) {
+                                char buf[64];
+                                snprintf(buf, sizeof(buf), "Loading: %d%%", (int)(sm.current_progress * 100));
+                                ColoredProgressBar(sm.current_progress, ImVec2(-1, 18), buf,
+                                    ImVec4(0.85f, 0.38f, 0.15f, 1.0f), ImVec4(0.15f, 0.82f, 0.45f, 1.0f));
+                            }
+                            if (sm.context_processing) {
+                                char buf[64];
+                                snprintf(buf, sizeof(buf), "Context: %d%%", (int)(sm.context_progress * 100));
+                                ColoredProgressBar(sm.context_progress, ImVec2(-1, 18), buf,
+                                    ImVec4(0.22f, 0.42f, 0.92f, 1.0f), ImVec4(0.35f, 0.95f, 0.40f, 1.0f));
+                            }
+                            if (sm.kv_cache_usage > 0.0f) {
+                                char buf[48];
+                                snprintf(buf, sizeof(buf), "KV: %d%%", (int)(sm.kv_cache_usage * 100));
+                                ColoredProgressBar(sm.kv_cache_usage, ImVec2(-1, 14), buf,
+                                    ImVec4(0.2f, 0.7f, 0.3f, 1.0f), ImVec4(1.0f, 0.2f, 0.2f, 1.0f));
+                            }
                             ImGui::Spacing();
                         }
+
+                        // --- Resizable terminal splitter ---
+                        ImGui::Separator();
+                        ImGui::Spacing();
+
+                        // Terminal label
+                        ImGui::TextColored(ImVec4(0.72f, 0.92f, 1.0f, 1.0f), "TERMINAL");
+                        ImGui::SameLine();
+                        ImGui::TextDisabled("(%s)", srv->config.name.c_str());
+
+                        // Calculate terminal height: remaining space in panel minus little margin
+                        float remaining_y = ImGui::GetContentRegionAvail().y;
+                        static float term_ratio = 0.55f;
+                        float term_h = remaining_y * term_ratio;
+                        if (term_h < 70.f)  term_h = 70.f;
+                        if (term_h > remaining_y - 10.f) term_h = remaining_y - 10.f;
+
+                        // Terminal log viewport (has its own internal scroll)
+                        ImGui::BeginChild("TerminalLog", ImVec2(-1, term_h), true,
+                            ImGuiWindowFlags_NoScrollbar);
+                        UiDrawServerLogViewport(srv);
+                        ImGui::EndChild();
+
+                        // Horizontal splitter handle (drag to resize terminal height)
+                        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.18f, 0.18f, 0.20f, 1.0f));
+                        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.30f, 0.30f, 0.35f, 1.0f));
+                        ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.35f, 0.35f, 0.40f, 1.0f));
+                        ImGui::Button("##hsplit", ImVec2(-1, 5));
+                        if (ImGui::IsItemActive() && ImGui::IsMouseDragging(0)) {
+                            term_ratio += ImGui::GetMouseDragDelta(0).y / remaining_y;
+                            if (term_ratio < 0.15f) term_ratio = 0.15f;
+                            if (term_ratio > 0.85f) term_ratio = 0.85f;
+                            ImGui::ResetMouseDragDelta(0);
+                        }
+                        ImGui::PopStyleColor(3);
 
                         ImGui::PopID();
                         ImGui::EndTabItem();
+                    } else {
+                        ImGui::PopStyleColor(2);
                     }
                 }
                 ImGui::EndTabBar();
             }
+
+            ImGui::EndChild(); // ActivePanel
         }
-
-        ImGui::EndChild(); // RightScroll — single scrollbar for launch form + inference
-
-        if (has_inference_nodes) {
-            ImGui::Separator();
-            ImGui::Spacing();
-
-            ServerInstance* term_srv = manager.running_servers[inference_tab_selected];
-            ImGui::PushID(term_srv);
-
-            ImGui::BeginChild("ModelTerminalDock", ImVec2(-1, kModelTerminalStripPx), true,
-                ImGuiWindowFlags_NoScrollbar);
-            ImGui::TextColored(ImVec4(0.72f, 0.92f, 1.0f, 1.0f), "MODEL TERMINAL");
-            ImGui::SameLine();
-            ImGui::TextDisabled("(selected inference tab)");
-            ImGui::Text("%s  ·  port %d", term_srv->config.name.c_str(), term_srv->config.port);
-            ImGui::TextDisabled("$ tail -f %s", term_srv->log_file_path.c_str());
-            ImGui::Spacing();
-            UiDrawServerLogViewport(term_srv);
-            ImGui::EndChild();
-
-            ImGui::PopID();
-        }
-        
-        ImGui::EndChild(); // End Content
 
         ToastDecayAndOverlay();
 
