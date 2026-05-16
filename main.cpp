@@ -124,43 +124,38 @@ static std::string format_duration(double seconds) {
     return buf;
 }
 
+void UiDrawLogTable(ServerInstance* srv, const std::string& filter, bool showInfo, bool showWarn, bool showErr) {
+    if (!srv) return;
+    
+    if (ImGui::BeginTable("LogTable", 3, ImGuiTableFlags_BordersInnerV | ImGuiTableFlags_SizingStretchSame | ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY)) {
+        ImGui::TableSetupColumn("Time", ImGuiTableColumnFlags_WidthFixed, 80.0f);
+        ImGui::TableSetupColumn("Level", ImGuiTableColumnFlags_WidthFixed, 60.0f);
+        ImGui::TableSetupColumn("Message", ImGuiTableColumnFlags_WidthStretch);
+        ImGui::TableHeadersRow();
+
+        auto logs = srv->get_logs();
+        for (const auto& entry : logs) {
+            // Filtering
+            if (!filter.empty() && entry.message.find(filter) == std::string::npos) continue;
+            if (entry.level == "INFO" && !showInfo) continue;
+            if (entry.level == "WARN" && !showWarn) continue;
+            if (entry.level == "ERROR" && !showErr) continue;
+
+            ImGui::TableNextRow();
+            ImGui::TableSetColumnIndex(0);
+            ImGui::TextDisabled("%s", entry.timestamp.c_str());
+            ImGui::TableSetColumnIndex(1);
+            ImGui::TextColored(entry.color, "%s", entry.level.c_str());
+            ImGui::TableSetColumnIndex(2);
+            ImGui::TextUnformatted(entry.message.c_str());
+        }
+        ImGui::EndTable();
+    }
+}
+
 /** Colored scrolling view of llama-server logs (shown in active-models terminal pane). */
 static void UiDrawServerLogViewport(ServerInstance* srv) {
-    if (!srv)
-        return;
-
-    ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.04f, 0.04f, 0.06f, 1.0f));
-    ImGui::BeginChild("LogViewport", ImVec2(-1, -1), false, ImGuiWindowFlags_HorizontalScrollbar);
-
-    std::deque<std::string> log_snapshot = srv->get_logs();
-    for (const auto& line : log_snapshot) {
-        if (line.find("error") != std::string::npos || line.find("fail") != std::string::npos ||
-            line.find("FAILED") != std::string::npos) {
-            ImGui::TextColored(ImVec4(1.0f, 0.3f, 0.3f, 1.0f), "%s", line.c_str());
-        } else if (line.find("print_timings") != std::string::npos) {
-            ImGui::TextColored(ImVec4(0.3f, 0.8f, 1.0f, 1.0f), "%s", line.c_str());
-        } else if (line.find("slot") != std::string::npos) {
-            ImGui::TextColored(ImVec4(0.8f, 0.8f, 0.2f, 1.0f), "%s", line.c_str());
-        } else if (line.find("loaded model") != std::string::npos || line.find("model loaded") != std::string::npos) {
-            ImGui::TextColored(ImVec4(0.2f, 1.0f, 0.4f, 1.0f), "%s", line.c_str());
-        } else if (line.find("server is listening") != std::string::npos || line.find("started") != std::string::npos) {
-            ImGui::TextColored(ImVec4(0.3f, 0.9f, 0.6f, 1.0f), "%s", line.c_str());
-        } else if (line.find("warning") != std::string::npos || line.find("WARN") != std::string::npos) {
-            ImGui::TextColored(ImVec4(1.0f, 0.85f, 0.3f, 1.0f), "%s", line.c_str());
-        } else if (line.find("progress") != std::string::npos || line.find("Progress") != std::string::npos) {
-            ImGui::TextColored(ImVec4(0.6f, 0.4f, 1.0f, 1.0f), "%s", line.c_str());
-        } else if (line.find("tokens per second") != std::string::npos) {
-            ImGui::TextColored(ImVec4(0.2f, 1.0f, 0.8f, 1.0f), "%s", line.c_str());
-        } else {
-            ImGui::TextUnformatted(line.c_str());
-        }
-    }
-
-    if (ImGui::GetScrollY() >= ImGui::GetScrollMaxY() - 2.f)
-        ImGui::SetScrollHereY(1.0f);
-
-    ImGui::EndChild();
-    ImGui::PopStyleColor();
+    UiDrawLogTable(srv, "", true, true, true);
 }
 
 // ============================================================
