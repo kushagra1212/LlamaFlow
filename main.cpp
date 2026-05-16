@@ -164,44 +164,14 @@ struct ServerFilterState {
     bool show_err = true;
 };
 
-/** Colored scrolling view of llama-server logs (shown in active-models terminal pane). */
-static void UiDrawServerLogViewport(ServerInstance* srv) {
-    static std::map<ServerInstance*, ServerFilterState> filters;
-    auto& state = filters[srv];
+struct LogSelectionState {
+    int selected_index = -1;
+};
 
-    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(8, 4));
-    
-    ImGui::TextDisabled("Filter:");
-    ImGui::SameLine();
-    ImGui::PushItemWidth(-120);
-    ImGui_InputText("##log_filter", &state.filter);
-    ImGui::PopItemWidth();
-
-    ImGui::SameLine();
-    ImGui::Checkbox("INFO", &state.show_info);
-    ImGui::SameLine();
-    ImGui::Checkbox("WARN", &state.show_warn);
-    ImGui::SameLine();
-    ImGui::Checkbox("ERR", &state.show_err);
-
-    ImGui::SameLine();
-    if (ImGui::Button("Copy All")) {
-        std::string all_logs;
-        for (const auto& entry : srv->get_logs()) {
-            if (!state.filter.empty() && entry.message.find(state.filter) == std::string::npos) continue;
-            if (entry.level == "INFO" && !state.show_info) continue;
-            if (entry.level == "WARN" && !state.show_warn) continue;
-            if (entry.level == "ERROR" && !state.show_err) continue;
-            all_logs += entry.timestamp + " [" + entry.level + "] " + entry.message + "\n";
-        }
-        ImGui::SetClipboardText(all_logs.c_str());
-        ToastPush(ToastKind::Success, "Filtered logs copied to clipboard.");
-    }
-    ImGui::PopStyleVar();
-    ImGui::Spacing();
-
-    UiDrawLogTable(srv, state.filter, state.show_info, state.show_warn, state.show_err);
-}
+struct ServerUIState {
+    ServerFilterState filter;
+    LogSelectionState selection;
+};
 
 // ============================================================
 //  Toast notifications (floating overlay)
@@ -280,6 +250,45 @@ static void ToastDecayAndOverlay() {
     ImGui::End();
     ImGui::PopStyleColor(2);
     ImGui::PopStyleVar(2);
+}
+
+/** Colored scrolling view of llama-server logs (shown in active-models terminal pane). */
+static void UiDrawServerLogViewport(ServerInstance* srv) {
+    static std::map<ServerInstance*, ServerUIState> server_states;
+    auto& state = server_states[srv];
+
+    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(8, 4));
+    
+    ImGui::TextDisabled("Filter:");
+    ImGui::SameLine();
+    ImGui::PushItemWidth(-120);
+    ImGui_InputText("##log_filter", &state.filter.filter);
+    ImGui::PopItemWidth();
+
+    ImGui::SameLine();
+    ImGui::Checkbox("INFO", &state.filter.show_info);
+    ImGui::SameLine();
+    ImGui::Checkbox("WARN", &state.filter.show_warn);
+    ImGui::SameLine();
+    ImGui::Checkbox("ERR", &state.filter.show_err);
+
+    ImGui::SameLine();
+    if (ImGui::Button("Copy All")) {
+        std::string all_logs;
+        for (const auto& entry : srv->get_logs()) {
+            if (!state.filter.filter.empty() && entry.message.find(state.filter.filter) == std::string::npos) continue;
+            if (entry.level == "INFO" && !state.filter.show_info) continue;
+            if (entry.level == "WARN" && !state.filter.show_warn) continue;
+            if (entry.level == "ERROR" && !state.filter.show_err) continue;
+            all_logs += entry.timestamp + " [" + entry.level + "] " + entry.message + "\\n";
+        }
+        ImGui::SetClipboardText(all_logs.c_str());
+        ToastPush(ToastKind::Success, "Filtered logs copied to clipboard.");
+    }
+    ImGui::PopStyleVar();
+    ImGui::Spacing();
+
+    UiDrawLogTable(srv, state.filter.filter, state.filter.show_info, state.filter.show_warn, state.filter.show_err);
 }
 
 static void UiLaunchOverviewTable(const char* id_scope, const LlamaConfig& cfg) {
@@ -388,6 +397,7 @@ static void ColoredProgressBar(float fraction, const ImVec2& size_arg, const cha
 //  THEME
 // ============================================================
 void ApplyMinimalistTheme() {
+
     ImGuiStyle* style = &ImGui::GetStyle();
     ImVec4* colors = style->Colors;
 
