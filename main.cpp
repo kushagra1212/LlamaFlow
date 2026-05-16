@@ -11,6 +11,7 @@
 #include <string>
 #include <algorithm>
 #include <map>
+#include <set>
 
 #include <cstdio>
 
@@ -127,35 +128,7 @@ static std::string format_duration(double seconds) {
 
 static bool g_maximize_logs = false;
 static ServerInstance* g_maximized_srv = nullptr;
-
-void UiDrawLogTable(ServerInstance* srv, const std::string& filter, bool showInfo, bool showWarn, bool showErr) {
-    if (!srv) return;
-    
-    if (ImGui::BeginTable("LogTable", 3, ImGuiTableFlags_BordersInnerV | ImGuiTableFlags_SizingStretchSame | ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY)) {
-        ImGui::TableSetupColumn("Time", ImGuiTableColumnFlags_WidthFixed, 80.0f);
-        ImGui::TableSetupColumn("Level", ImGuiTableColumnFlags_WidthFixed, 60.0f);
-        ImGui::TableSetupColumn("Message", ImGuiTableColumnFlags_WidthStretch);
-        ImGui::TableHeadersRow();
-
-        auto logs = srv->get_logs();
-        for (const auto& entry : logs) {
-            // Filtering
-            if (!filter.empty() && entry.message.find(filter) == std::string::npos) continue;
-            if (entry.level == "INFO" && !showInfo) continue;
-            if (entry.level == "WARN" && !showWarn) continue;
-            if (entry.level == "ERROR" && !showErr) continue;
-
-            ImGui::TableNextRow();
-            ImGui::TableSetColumnIndex(0);
-            ImGui::TextDisabled("%s", entry.timestamp.c_str());
-            ImGui::TableSetColumnIndex(1);
-            ImGui::TextColored(entry.color, "%s", entry.level.c_str());
-            ImGui::TableSetColumnIndex(2);
-            ImGui::TextUnformatted(entry.message.c_str());
-        }
-        ImGui::EndTable();
-    }
-}
+static ImFont* g_mono_font = nullptr;   // monospace font for the log terminal
 
 struct ServerFilterState {
     std::string filter;
@@ -165,17 +138,18 @@ struct ServerFilterState {
 };
 
 struct LogSelectionState {
-    int selected_index = -1;
+    std::set<int> selected_indices;
 };
 
 struct ServerUIState {
     ServerFilterState filter;
     LogSelectionState selection;
+    bool raw_view = true;        // raw mode = native drag-select + Cmd/Ctrl+C
+    bool newest_first = true;    // reverse order: newest log at the top
+    bool autoscroll = true;      // stick to newest line unless user scrolled up
+    std::string raw_cache;       // backing buffer for the raw read-only textbox
 };
 
-// ============================================================
-//  Toast notifications (floating overlay)
-// ============================================================
 enum class ToastKind { Info, Success, Warn, Err };
 
 struct Toast {
@@ -192,6 +166,160 @@ static void ToastPush(ToastKind k, std::string msg) {
         g_toasts.pop_front();
 }
 
+// Shared filter predicate: matches the existing INFO/WARN/ERROR + substring rules.
+static bool LogEntryPasses(const LogEntry& e, const ServerFilterState& f) {
+    if (!f.filter.empty() && e.message.find(f.filter) == std::string::npos) return false;
+    if (e.level == "INFO"  && !f.show_info) return false;
+    if (e.level == "WARN"  && !f.show_warn) return false;
+    if (e.level == "ERROR" && !f.show_err)  return false;
+    return true;
+}
+
+void UiDrawLogTable(ServerInstance* srv, ServerUIState& state) {
+    if (!srv) return;
+
+    auto logs = srv->get_logs();
+
+    // ---------- RAW view: real native click-drag selection + Cmd/Ctrl+C ----------
+    if (state.raw_view) {
+        state.raw_cache.clear();
+        state.raw_cache.reserve(logs.size() * 80 + 1);
+        auto append = [&](const LogEntry& e) {
+            if (!LogEntryPasses(e, state.filter)) return;
+            if (!e.timestamp.empty()) { state.raw_cache += '['; state.raw_cache += e.timestamp; state.raw_cache += "] "; }
+            state.raw_cache += '['; state.raw_cache += e.level; state.raw_cache += "] ";
+            state.raw_cache += e.message;
+            state.raw_cache += '\n';
+        };
+        if (state.newest_first)
+            for (auto it = logs.rbegin(); it != logs.rend(); ++it) append(*it);
+        else
+            for (const auto& e : logs) append(e);
+        if (g_mono_font) ImGui::PushFont(g_mono_font);
+        ImGui::InputTextMultiline("##rawlogs",
+            (char*)state.raw_cache.c_str(), state.raw_cache.size() + 1,
+            ImVec2(-1, -1), ImGuiInputTextFlags_ReadOnly);
+        if (g_mono_font) ImGui::PopFont();
+        return;
+    }
+
+    // ---------- TABLE view: clipped, uniform single-line rows ----------
+    // Pre-filter into a stable index list so ImGuiListClipper can virtualize
+    // (essential now that we retain up to 100k lines).
+    static std::vector<int> vis;
+    vis.clear();
+    for (int i = 0; i < (int)logs.size(); ++i)
+        if (LogEntryPasses(logs[i], state.filter)) vis.push_back(i);
+    if (state.newest_first)
+        std::reverse(vis.begin(), vis.end());
+
+    ImGuiTableFlags flags = ImGuiTableFlags_BordersInnerV | ImGuiTableFlags_RowBg
+                          | ImGuiTableFlags_ScrollY | ImGuiTableFlags_ScrollX;
+    if (ImGui::BeginTable("LogTable", 3, flags)) {
+        ImGui::TableSetupScrollFreeze(0, 1);
+        ImGui::TableSetupColumn("Time",    ImGuiTableColumnFlags_WidthFixed, 76.0f);
+        ImGui::TableSetupColumn("Level",   ImGuiTableColumnFlags_WidthFixed, 54.0f);
+        ImGui::TableSetupColumn("Message", ImGuiTableColumnFlags_WidthFixed, 4000.0f);
+        ImGui::TableHeadersRow();
+
+        if (g_mono_font) ImGui::PushFont(g_mono_font);
+
+        ImGuiListClipper clipper;
+        clipper.Begin((int)vis.size());
+        while (clipper.Step()) {
+            for (int row = clipper.DisplayStart; row < clipper.DisplayEnd; ++row) {
+                int i = vis[row];
+                const LogEntry& entry = logs[i];
+
+                ImGui::TableNextRow();
+                ImGui::PushID(i);
+
+                // Full-row selectable FIRST. Uniform line height => the hit
+                // region and the highlight always line up (fixes the old
+                // multi-line overlap garble). Content is drawn on top after.
+                ImGui::TableSetColumnIndex(0);
+                bool is_selected = state.selection.selected_indices.count(i) > 0;
+                ImGui::SetNextItemAllowOverlap();
+                if (ImGui::Selectable("##row", is_selected,
+                        ImGuiSelectableFlags_SpanAllColumns | ImGuiSelectableFlags_AllowOverlap)) {
+                    if (ImGui::GetIO().KeyCtrl || ImGui::GetIO().KeySuper) {
+                        if (is_selected) state.selection.selected_indices.erase(i);
+                        else state.selection.selected_indices.insert(i);
+                    } else {
+                        state.selection.selected_indices.clear();
+                        state.selection.selected_indices.insert(i);
+                    }
+                }
+
+                std::string line_text =
+                    (entry.timestamp.empty() ? std::string() : "[" + entry.timestamp + "] ")
+                    + "[" + entry.level + "] " + entry.message;
+
+                if (ImGui::IsItemHovered() && ImGui::IsMouseDoubleClicked(0)) {
+                    ImGui::SetClipboardText(line_text.c_str());
+                    ToastPush(ToastKind::Success, "Line copied to clipboard.");
+                }
+                if (ImGui::BeginPopupContextItem("ctx")) {
+                    if (ImGui::MenuItem("Copy Line")) {
+                        ImGui::SetClipboardText(line_text.c_str());
+                        ToastPush(ToastKind::Success, "Line copied to clipboard.");
+                    }
+                    ImGui::Separator();
+                    bool shown = (entry.level == "INFO"  && state.filter.show_info)
+                              || (entry.level == "WARN"  && state.filter.show_warn)
+                              || (entry.level == "ERROR" && state.filter.show_err);
+                    std::string fl = (shown ? "Hide " : "Show ") + entry.level;
+                    if (ImGui::MenuItem(fl.c_str())) {
+                        if (entry.level == "INFO")       state.filter.show_info = !state.filter.show_info;
+                        else if (entry.level == "WARN")  state.filter.show_warn = !state.filter.show_warn;
+                        else if (entry.level == "ERROR") state.filter.show_err  = !state.filter.show_err;
+                    }
+                    ImGui::EndPopup();
+                }
+
+                // Overlay content (re-entering each column resets the cursor
+                // to that cell's top-left, drawing over the selectable).
+                ImGui::TableSetColumnIndex(0);
+                ImGui::TextDisabled("%s", entry.timestamp.c_str());
+
+                ImGui::TableSetColumnIndex(1);
+                ImVec2 bp = ImGui::GetCursorScreenPos();
+                float bw = 48.0f, bh = ImGui::GetTextLineHeight();
+                ImGui::GetWindowDrawList()->AddRectFilled(
+                    bp, ImVec2(bp.x + bw, bp.y + bh), ImColor(entry.color), 3.0f);
+                ImGui::SetCursorPosX(ImGui::GetCursorPosX() + 5.0f);
+                ImGui::TextColored(ImVec4(0, 0, 0, 1), "%s", entry.level.c_str());
+
+                ImGui::TableSetColumnIndex(2);
+                ImGui::TextUnformatted(entry.message.c_str());
+
+                ImGui::PopID();
+            }
+        }
+        clipper.End();
+
+        if (g_mono_font) ImGui::PopFont();
+
+        // Follow the newest line. With newest-first the newest row is at the
+        // top, so snap to top; otherwise stick to bottom — and only while the
+        // user hasn't scrolled away to read (no missed lines).
+        if (state.autoscroll) {
+            if (state.newest_first) {
+                if (ImGui::GetScrollY() <= 0.0f) ImGui::SetScrollY(0.0f);
+            } else if (ImGui::GetScrollY() >= ImGui::GetScrollMaxY()) {
+                ImGui::SetScrollHereY(1.0f);
+            }
+        }
+
+        ImGui::EndTable();
+    }
+}
+
+// ============================================================
+//  Toast notifications (floating overlay)
+// ============================================================
+
+
 static void ToastDecayAndOverlay() {
     const double now = ImGui::GetTime();
     while (!g_toasts.empty() && g_toasts.front().expires_at < now)
@@ -202,9 +330,9 @@ static void ToastDecayAndOverlay() {
     ImGuiViewport* vp = ImGui::GetMainViewport();
     const float pane_w = 440.f;
 
-    ImGui::SetNextWindowPos(ImVec2(vp->Pos.x + vp->Size.x - 18.f, vp->Pos.y + 78.f),
+    ImGui::SetNextWindowPos(ImVec2(vp->Pos.x + vp->Size.x - 18.f, vp->Pos.y + vp->Size.y - 18.f),
         ImGuiCond_Always,
-        ImVec2(1.0f, 0.0f));
+        ImVec2(1.0f, 1.0f));
     ImGui::SetNextWindowSize(ImVec2(pane_w, 0.f));
 
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(14, 10));
@@ -252,19 +380,64 @@ static void ToastDecayAndOverlay() {
     ImGui::PopStyleVar(2);
 }
 
+static std::map<ServerInstance*, ServerUIState> g_server_ui_states;
+
 /** Colored scrolling view of llama-server logs (shown in active-models terminal pane). */
 static void UiDrawServerLogViewport(ServerInstance* srv) {
-    static std::map<ServerInstance*, ServerUIState> server_states;
-    auto& state = server_states[srv];
+    auto& state = g_server_ui_states[srv];
 
-    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(8, 4));
-    
+    auto fmt_line = [](const LogEntry& e) {
+        return (e.timestamp.empty() ? std::string() : "[" + e.timestamp + "] ")
+             + "[" + e.level + "] " + e.message + "\n";
+    };
+
+    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(6, 5));
+
+    // --- Row 1: view mode + copy actions (kept first so they never clip off) ---
+    if (ImGui::Button(state.raw_view ? "Table View" : "Raw View"))
+        state.raw_view = !state.raw_view;
+    ImGui::SameLine();
+    if (ImGui::Button("Copy All")) {
+        std::string out;
+        for (const auto& e : srv->get_logs()) out += fmt_line(e);
+        ImGui::SetClipboardText(out.c_str());
+        ToastPush(ToastKind::Success, "All logs copied to clipboard.");
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Copy Visible")) {
+        std::string out;
+        for (const auto& e : srv->get_logs())
+            if (LogEntryPasses(e, state.filter)) out += fmt_line(e);
+        ImGui::SetClipboardText(out.c_str());
+        ToastPush(ToastKind::Success, "Visible logs copied to clipboard.");
+    }
+    ImGui::SameLine();
+    bool has_selection = !state.selection.selected_indices.empty();
+    if (!has_selection) ImGui::BeginDisabled();
+    if (ImGui::Button("Copy Sel")) {
+        std::string out;
+        auto logs = srv->get_logs();
+        for (int idx : state.selection.selected_indices)
+            if (idx >= 0 && idx < (int)logs.size()) out += fmt_line(logs[idx]);
+        ImGui::SetClipboardText(out.c_str());
+        ToastPush(ToastKind::Success, "Selected logs copied to clipboard.");
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Clear Sel"))
+        state.selection.selected_indices.clear();
+    if (!has_selection) ImGui::EndDisabled();
+    ImGui::SameLine();
+    ImGui::Checkbox("Newest first", &state.newest_first);
+    ImGui::SameLine();
+    ImGui::Checkbox("Auto-scroll", &state.autoscroll);
+
+    // --- Row 2: filter + level toggles ---
     ImGui::TextDisabled("Filter:");
     ImGui::SameLine();
-    ImGui::PushItemWidth(-120);
+    ImGui::SetNextItemWidth(220.0f);
     ImGui_InputText("##log_filter", &state.filter.filter);
-    ImGui::PopItemWidth();
-
+    ImGui::SameLine();
+    if (ImGui::Button("Clear##filter")) state.filter.filter.clear();
     ImGui::SameLine();
     ImGui::Checkbox("INFO", &state.filter.show_info);
     ImGui::SameLine();
@@ -272,23 +445,10 @@ static void UiDrawServerLogViewport(ServerInstance* srv) {
     ImGui::SameLine();
     ImGui::Checkbox("ERR", &state.filter.show_err);
 
-    ImGui::SameLine();
-    if (ImGui::Button("Copy All")) {
-        std::string all_logs;
-        for (const auto& entry : srv->get_logs()) {
-            if (!state.filter.filter.empty() && entry.message.find(state.filter.filter) == std::string::npos) continue;
-            if (entry.level == "INFO" && !state.filter.show_info) continue;
-            if (entry.level == "WARN" && !state.filter.show_warn) continue;
-            if (entry.level == "ERROR" && !state.filter.show_err) continue;
-            all_logs += entry.timestamp + " [" + entry.level + "] " + entry.message + "\\n";
-        }
-        ImGui::SetClipboardText(all_logs.c_str());
-        ToastPush(ToastKind::Success, "Filtered logs copied to clipboard.");
-    }
     ImGui::PopStyleVar();
     ImGui::Spacing();
 
-    UiDrawLogTable(srv, state.filter.filter, state.filter.show_info, state.filter.show_warn, state.filter.show_err);
+    UiDrawLogTable(srv, state);
 }
 
 static void UiLaunchOverviewTable(const char* id_scope, const LlamaConfig& cfg) {
@@ -394,79 +554,22 @@ static void ColoredProgressBar(float fraction, const ImVec2& size_arg, const cha
 }
 
 // ============================================================
+//  Toast notifications (floating overlay)
+// ============================================================
+
+
+
+// ============================================================
 //  THEME
 // ============================================================
 void ApplyMinimalistTheme() {
-
-    ImGuiStyle* style = &ImGui::GetStyle();
-    ImVec4* colors = style->Colors;
-
-    // Structural Geometry
-    style->WindowRounding = 8.0f;
-    style->FrameRounding = 6.0f;
-    style->GrabRounding = 6.0f;
-    style->PopupRounding = 6.0f;
-    style->ChildRounding = 8.0f;
-    style->TabRounding = 6.0f;
-    
-    style->WindowBorderSize = 0.0f;
-    style->FrameBorderSize = 0.0f;
-    style->ChildBorderSize = 1.0f;
-    style->TabBorderSize = 0.0f;
-    
-    style->ItemSpacing = ImVec2(8, 10);
-    style->ItemInnerSpacing = ImVec2(6, 6);
-    style->ScrollbarSize = 8.0f;
-    style->ScrollbarRounding = 4.0f;
-    
-    style->Colors[ImGuiCol_Text]                   = ImVec4(0.95f, 0.95f, 0.95f, 1.00f);
-    style->Colors[ImGuiCol_TextDisabled]           = ImVec4(0.50f, 0.50f, 0.50f, 1.00f);
-    style->Colors[ImGuiCol_WindowBg]               = ImVec4(0.10f, 0.10f, 0.10f, 1.00f);
-    style->Colors[ImGuiCol_ChildBg]                = ImVec4(0.13f, 0.13f, 0.14f, 1.00f);
-    style->Colors[ImGuiCol_PopupBg]                = ImVec4(0.13f, 0.13f, 0.14f, 1.00f);
-    style->Colors[ImGuiCol_Border]                 = ImVec4(0.20f, 0.20f, 0.22f, 1.00f);
-    style->Colors[ImGuiCol_FrameBg]                = ImVec4(0.18f, 0.18f, 0.20f, 1.00f);
-    style->Colors[ImGuiCol_FrameBgHovered]         = ImVec4(0.23f, 0.23f, 0.25f, 1.00f);
-    style->Colors[ImGuiCol_FrameBgActive]          = ImVec4(0.28f, 0.28f, 0.30f, 1.00f);
-    style->Colors[ImGuiCol_TitleBg]                = ImVec4(0.10f, 0.10f, 0.10f, 1.00f);
-    style->Colors[ImGuiCol_TitleBgActive]          = ImVec4(0.15f, 0.15f, 0.17f, 1.00f);
-    style->Colors[ImGuiCol_MenuBarBg]              = ImVec4(0.13f, 0.13f, 0.14f, 1.00f);
-    style->Colors[ImGuiCol_ScrollbarBg]            = ImVec4(0.10f, 0.10f, 0.10f, 1.00f);
-    style->Colors[ImGuiCol_ScrollbarGrab]          = ImVec4(0.30f, 0.30f, 0.32f, 1.00f);
-    style->Colors[ImGuiCol_ScrollbarGrabHovered]   = ImVec4(0.40f, 0.40f, 0.42f, 1.00f);
-    style->Colors[ImGuiCol_ScrollbarGrabActive]    = ImVec4(0.50f, 0.50f, 0.52f, 1.00f);
-    style->Colors[ImGuiCol_CheckMark]              = ImVec4(0.40f, 0.80f, 1.00f, 1.00f);
-    style->Colors[ImGuiCol_SliderGrab]             = ImVec4(0.40f, 0.70f, 1.00f, 1.00f);
-    style->Colors[ImGuiCol_SliderGrabActive]       = ImVec4(0.50f, 0.80f, 1.00f, 1.00f);
-    style->Colors[ImGuiCol_Button]                 = ImVec4(0.23f, 0.23f, 0.25f, 1.00f);
-    style->Colors[ImGuiCol_ButtonHovered]          = ImVec4(0.33f, 0.33f, 0.35f, 1.00f);
-    style->Colors[ImGuiCol_ButtonActive]           = ImVec4(0.43f, 0.43f, 0.45f, 1.00f);
-    style->Colors[ImGuiCol_Header]                 = ImVec4(0.25f, 0.28f, 0.32f, 1.00f);
-    style->Colors[ImGuiCol_HeaderHovered]          = ImVec4(0.30f, 0.33f, 0.38f, 1.00f);
-    style->Colors[ImGuiCol_HeaderActive]           = ImVec4(0.35f, 0.38f, 0.43f, 1.00f);
-    style->Colors[ImGuiCol_Separator]              = ImVec4(0.20f, 0.20f, 0.22f, 1.00f);
-    style->Colors[ImGuiCol_SeparatorHovered]       = ImVec4(0.30f, 0.30f, 0.32f, 1.00f);
-    style->Colors[ImGuiCol_SeparatorActive]        = ImVec4(0.40f, 0.40f, 0.42f, 1.00f);
-    style->Colors[ImGuiCol_ResizeGrip]             = ImVec4(0.30f, 0.30f, 0.32f, 1.00f);
-    style->Colors[ImGuiCol_ResizeGripHovered]      = ImVec4(0.40f, 0.40f, 0.42f, 1.00f);
-    style->Colors[ImGuiCol_ResizeGripActive]       = ImVec4(0.50f, 0.50f, 0.52f, 1.00f);
-    style->Colors[ImGuiCol_Tab]                    = ImVec4(0.14f, 0.14f, 0.16f, 1.00f);
-    style->Colors[ImGuiCol_TabHovered]             = ImVec4(0.24f, 0.24f, 0.28f, 1.00f);
-    style->Colors[ImGuiCol_TabActive]              = ImVec4(0.28f, 0.30f, 0.35f, 1.00f);
-    style->Colors[ImGuiCol_TabUnfocused]           = ImVec4(0.14f, 0.14f, 0.16f, 1.00f);
-    style->Colors[ImGuiCol_TabUnfocusedActive]     = ImVec4(0.20f, 0.20f, 0.24f, 1.00f);
-    style->Colors[ImGuiCol_PlotLines]              = ImVec4(0.40f, 0.70f, 1.00f, 1.00f);
-    style->Colors[ImGuiCol_PlotLinesHovered]       = ImVec4(0.60f, 0.80f, 1.00f, 1.00f);
-    style->Colors[ImGuiCol_PlotHistogram]          = ImVec4(0.40f, 0.70f, 1.00f, 1.00f);
-    style->Colors[ImGuiCol_PlotHistogramHovered]   = ImVec4(0.60f, 0.80f, 1.00f, 1.00f);
-    style->Colors[ImGuiCol_TextSelectedBg]         = ImVec4(0.25f, 0.50f, 0.80f, 1.00f);
-    style->Colors[ImGuiCol_ModalWindowDimBg]       = ImVec4(0.05f, 0.05f, 0.05f, 0.60f);
 }
 
 // ============================================================
 //  MAIN
 // ============================================================
 int main() {
+
     if (!glfwInit()) return -1;
     glfwWindowHint(GLFW_CONTEXT_VERSION_MAJOR, 3);
     glfwWindowHint(GLFW_CONTEXT_VERSION_MINOR, 2);
@@ -487,9 +590,14 @@ int main() {
     }
     if (!font) {
         io.Fonts->AddFontDefault();
-        io.FontGlobalScale = 1.4f; 
+        io.FontGlobalScale = 1.4f;
     }
-    
+
+    // Monospace font for the log terminal (aligned columns + IDE feel).
+    g_mono_font = io.Fonts->AddFontFromFileTTF("/System/Library/Fonts/Menlo.ttc", 15.0f);
+    if (!g_mono_font)
+        g_mono_font = io.Fonts->AddFontFromFileTTF("C:\\Windows\\Fonts\\consola.ttf", 15.0f);
+
     ApplyMinimalistTheme();
 
     ImGui_ImplGlfw_InitForOpenGL(window, true);

@@ -12,5 +12,12 @@
         "model_path": "/Users/apple/.cache/huggingface/hub/models--unsloth--Qwen3-0.6B-GGUF/snapshots/50968a4468ef4233ed78cd7c3de230dd1d61a56b/Qwen3-0.6B-UD-Q4_K_XL.gguf",
         "name": "Qwen3-0.6B-embedding",
         "port": 8080
+    },
+    {
+        "custom_args": "-c  16384 --mmproj /Users/apple/.cache/huggingface/hub/models--Mungert--Qwen2.5-VL-7B-Instruct-GGUF/snapshots/836d9172b4eb85fd1ce6fc433fd6a8cd63c5dcc1/Qwen2.5-VL-7B-Instruct-mmproj-bf16.gguf",
+        "exec_path": "/Users/apple/code/per/llama.cpp/build/bin/llama-server",
+        "model_path": "/Users/apple/.cache/huggingface/hub/models--Mungert--Qwen2.5-VL-7B-Instruct-GGUF/snapshots/836d9172b4eb85fd1ce6fc433fd6a8cd63c5dcc1/Qwen2.5-VL-7B-Instruct-q4_k_m.gguf",
+        "name": "Qwen2.5-VL-7B",
+        "port": 8080
     }
 ]

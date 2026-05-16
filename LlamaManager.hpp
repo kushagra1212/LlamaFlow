@@ -9,6 +9,7 @@
 #include <chrono>
 #include <cstdint>
 #include <sys/types.h>
+#include "imgui.h"
 #include "json.hpp" // nlohmann/json
 
 using json = nlohmann::json;

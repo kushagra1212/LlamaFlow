@@ -622,8 +622,8 @@ void ServerInstance::stop() {
             }
         } else {
             std::lock_guard<std::mutex> lg(log_mutex);
-            logs.push_back(
-                "Stop: could not find listener PID (install `lsof` in PATH, or quit llama-server manually).");
+            logs.push_back(parse_log_line(
+                "Stop: could not find listener PID (install `lsof` in PATH, or quit llama-server manually)."));
         }
 
         shutdown_phase.store(PHASE_JOIN, std::memory_order_release);
@@ -898,7 +898,7 @@ void ServerInstance::tail_logs() {
                                 logs.push_back(parse_log_line(current_line));
                             }
                             
-                            if (logs.size() > 500) logs.pop_front();
+                            if (logs.size() > 100000) logs.pop_front();
                             current_line.clear();
                         }
                     } else {
