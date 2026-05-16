@@ -125,6 +125,9 @@ static std::string format_duration(double seconds) {
     return buf;
 }
 
+static bool g_maximize_logs = false;
+static ServerInstance* g_maximized_srv = nullptr;
+
 void UiDrawLogTable(ServerInstance* srv, const std::string& filter, bool showInfo, bool showWarn, bool showErr) {
     if (!srv) return;
     
@@ -884,6 +887,11 @@ int main() {
                         ImGui::TextColored(ImVec4(0.72f, 0.92f, 1.0f, 1.0f), "TERMINAL");
                         ImGui::SameLine();
                         ImGui::TextDisabled("(%s)", srv->config.name.c_str());
+                        ImGui::SameLine();
+                        if (ImGui::Button("Maximize")) {
+                            g_maximize_logs = true;
+                            g_maximized_srv = srv;
+                        }
 
                         // Calculate terminal height: remaining space in panel minus little margin
                         float remaining_y = ImGui::GetContentRegionAvail().y;
@@ -924,6 +932,30 @@ int main() {
         }
 
         ToastDecayAndOverlay();
+
+        if (g_maximize_logs && g_maximized_srv) {
+            ImGuiViewport* vp = ImGui::GetMainViewport();
+            ImGui::SetNextWindowPos(ImVec2(vp->Pos.x + vp->Size.x * 0.5f, vp->Pos.y + vp->Size.y * 0.5f), 
+                ImGuiCond_Always, ImVec2(0.5f, 0.5f));
+            ImGui::SetNextWindowSize(ImVec2(vp->Size.x * 0.8f, vp->Size.y * 0.8f));
+            
+            if (ImGui::Begin("Log Viewer", &g_maximize_logs, ImGuiWindowFlags_NoCollapse)) {
+                if (ImGui::Button("Close")) {
+                    g_maximize_logs = false;
+                    g_maximized_srv = nullptr;
+                }
+                ImGui::SameLine();
+                ImGui::TextDisabled("Log output from maximized server");
+                ImGui::Separator();
+                ImGui::Spacing();
+                
+                UiDrawServerLogViewport(g_maximized_srv);
+                
+                ImGui::End();
+            }
+            if (!g_maximize_logs) g_maximized_srv = nullptr;
+        }
+
 
         // ============================================================
         //  BOTTOM STATUS BAR
