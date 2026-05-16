@@ -53,6 +53,35 @@ static bool any_target_alive(const std::vector<pid_t>& targets) {
 
 } // namespace
 
+// --- Helper: Parse raw line into structured LogEntry ---
+static LogEntry parse_log_line(const std::string& line) {
+    LogEntry entry;
+    entry.message = line;
+    entry.level = "DEBUG";
+    entry.color = ImVec4(0.7f, 0.7f, 0.7f, 1.0f);
+
+    if (line.find("error") != std::string::npos || line.find("fail") != std::string::npos || line.find("FAILED") != std::string::npos) {
+        entry.level = "ERROR";
+        entry.color = ImVec4(1.0f, 0.3f, 0.3f, 1.0f);
+    } else if (line.find("warning") != std::string::npos || line.find("WARN") != std::string::npos) {
+        entry.level = "WARN";
+        entry.color = ImVec4(1.0f, 0.85f, 0.3f, 1.0f);
+    } else if (line.find("loaded model") != std::string::npos || line.find("server is listening") != std::string::npos || line.find("started") != std::string::npos) {
+        entry.level = "INFO";
+        entry.color = ImVec4(0.2f, 1.0f, 0.4f, 1.0f);
+    }
+
+    if (!line.empty() && line[0] == '[') {
+        size_t end_bracket = line.find(']');
+        if (end_bracket != std::string::npos) {
+            entry.timestamp = line.substr(1, end_bracket - 1);
+            entry.message = line.substr(end_bracket + 1);
+            if (!entry.message.empty() && entry.message[0] == ' ') entry.message.erase(0, 1);
+        }
+    }
+    return entry;
+}
+
 const char* ServerInstance::shutdown_status_text() const {
     switch (shutdown_phase.load(std::memory_order_acquire)) {
         case PHASE_NONE:
@@ -498,7 +527,7 @@ void ServerInstance::start() {
     int log_fd = open(log_file_path.c_str(), O_WRONLY | O_CREAT | O_APPEND, 0644);
     if (log_fd < 0) {
         std::lock_guard<std::mutex> lock(log_mutex);
-        logs.push_back("FAILED to open log file: " + log_file_path);
+        logs.push_back(parse_log_line("FAILED to open log file: " + log_file_path));
         return;
     }
 
@@ -532,13 +561,13 @@ void ServerInstance::start() {
         // Log success
         {
             std::lock_guard<std::mutex> lock(log_mutex);
-            logs.push_back("Launched PID " + std::to_string(pid) + " -> " + log_file_path);
+            logs.push_back(parse_log_line("Launched PID " + std::to_string(pid) + " -> " + log_file_path));
         }
     } else {
         // --- Fork failed ---
         close(log_fd);
         std::lock_guard<std::mutex> lock(log_mutex);
-        logs.push_back("FAILED to fork(): " + std::string(strerror(errno)));
+        logs.push_back(parse_log_line("FAILED to fork(): " + std::string(strerror(errno))));
     }
 }
 
@@ -563,7 +592,7 @@ void ServerInstance::stop() {
                 for (pid_t t : targets)
                     msg += " " + std::to_string((int)t);
                 msg += " (port " + std::to_string(config.port) + ")";
-                logs.push_back(msg);
+                logs.push_back(parse_log_line(msg));
             }
 
             shutdown_phase.store(PHASE_SIGTERM, std::memory_order_release);
@@ -863,10 +892,10 @@ void ServerInstance::tail_logs() {
                             // ====================================
 
                             // If it's a progress update, replace the last line to avoid spam
-                            if (c == '\r' && !logs.empty() && (logs.back().find("...") != std::string::npos || logs.back().find("progress") != std::string::npos)) {
-                                logs.back() = current_line; 
+                            if (c == '\r' && !logs.empty() && (logs.back().message.find("...") != std::string::npos || logs.back().message.find("progress") != std::string::npos)) {
+                                logs.back() = parse_log_line(current_line); 
                             } else {
-                                logs.push_back(current_line);
+                                logs.push_back(parse_log_line(current_line));
                             }
                             
                             if (logs.size() > 500) logs.pop_front();
@@ -1032,7 +1061,7 @@ bool LlamaManager::launch_server(const LlamaConfig& config) {
         {
             std::lock_guard<std::mutex> lock(instance->log_mutex);
             for (const auto& line : instance->logs) {
-                last_launch_error += "\n  " + line;
+                last_launch_error += "\n  " + line.message;
             }
         }
         delete instance;
