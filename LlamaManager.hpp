@@ -70,6 +70,33 @@ struct LogEntry {
     ImVec4 color;
 };
 
+// Passive health: derived from /health polling + model load state
+enum class HealthState : int {
+    Unknown = 0,   // started, no data yet
+    Loading,       // model still loading
+    Healthy,       // /health 200 and model loaded
+    Degraded,      // responding but slow
+    Down,          // not answering while we expect it to
+    Stopped
+};
+
+// Active functional probe: result of an on-demand real request
+enum class ProbeState : int {
+    None = 0,      // never run
+    Running,       // request in flight
+    Pass,          // got a valid, non-empty response
+    Fail           // error / empty / bad response
+};
+
+// Snapshot of probe result (copied out under probe_mutex for the UI thread)
+struct ProbeResult {
+    ProbeState state = ProbeState::None;
+    bool       vision = false;     // true if last probe was an image test
+    double     latency_ms = 0.0;
+    std::string summary;           // one-line plain-English verdict
+    std::string detail;            // model reply snippet, or the error
+};
+
 class ServerInstance {
 public:
     LlamaConfig config;
@@ -105,6 +132,21 @@ public:
     std::atomic<float> model_load_seconds{0.0f};
     std::atomic<uint64_t> model_memory_bytes{0};
 
+    // --- Passive health (updated by poll_health) ---
+    std::atomic<int>    health_state{(int)HealthState::Unknown};
+    std::atomic<double> last_health_latency_ms{0.0};   // last /health round-trip
+    std::atomic<int>    health_fail_streak{0};         // consecutive failed polls
+    std::atomic<long>   last_health_ok_epoch{0};       // time() of last 200, 0 = never
+
+    // --- Active probe (on-demand real request; see run_probe) ---
+    std::thread        probe_thread;
+    std::atomic<bool>  probe_in_flight{false};
+    mutable std::mutex probe_mutex;                    // guards probe_result_
+    ProbeResult        probe_result_;
+
+    // Recent ERROR/WARN lines, mirrored from the log stream for the Issues panel
+    std::deque<LogEntry> recent_issues;                // guarded by log_mutex
+
     // Start time for uptime
     std::chrono::steady_clock::time_point start_time;
 
@@ -116,6 +158,25 @@ public:
     void stop();
     void tail_logs();
     void poll_health();                  // localhost HTTP (/health,/slots,/metrics — optional --metrics)
+
+    // True when launch args carry a multimodal projector (--mmproj): vision model.
+    bool has_mmproj() const;
+
+    // Fire a single real request on a background thread (no-op if one is already
+    // in flight). vision=true sends an embedded test image. Result -> probe_result().
+    void run_probe(bool vision);
+
+    // Lock-free-ish copy of the latest probe result for the UI thread.
+    ProbeResult probe_result() const {
+        std::lock_guard<std::mutex> lock(probe_mutex);
+        return probe_result_;
+    }
+
+    // Thread-safe copy of recent ERROR/WARN lines for the Issues panel.
+    std::deque<LogEntry> get_recent_issues() const {
+        std::lock_guard<std::mutex> lock(log_mutex);
+        return recent_issues;
+    }
 
 
     // Snapshot all metrics atomically (lock-free)

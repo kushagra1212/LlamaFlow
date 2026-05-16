@@ -14,7 +14,7 @@
         "port": 8080
     },
     {
-        "custom_args": "-c  16384 --mmproj /Users/apple/.cache/huggingface/hub/models--Mungert--Qwen2.5-VL-7B-Instruct-GGUF/snapshots/836d9172b4eb85fd1ce6fc433fd6a8cd63c5dcc1/Qwen2.5-VL-7B-Instruct-mmproj-bf16.gguf",
+        "custom_args": "  -c 16384 \\\n  --mmproj /Users/apple/.cache/huggingface/hub/models--Mungert--Qwen2.5-VL-7B-Instruct-GGUF/snapshots/836d9172b4eb85fd1ce6fc433fd6a8cd63c5dcc1/Qwen2.5-VL-7B-Instruct-mmproj-bf16.gguf \\\n  -m /Users/apple/.cache/huggingface/hub/models--Mungert--Qwen2.5-VL-7B-Instruct-GGUF/snapshots/836d9172b4eb85fd1ce6fc433fd6a8cd63c5dcc1/Qwen2.5-VL-7B-Instruct-q4_k_m.gguf \\\n  -ngl 99 \\\n  -t 4 \\\n  -b 256 \\\n  -ub 256",
         "exec_path": "/Users/apple/code/per/llama.cpp/build/bin/llama-server",
         "model_path": "/Users/apple/.cache/huggingface/hub/models--Mungert--Qwen2.5-VL-7B-Instruct-GGUF/snapshots/836d9172b4eb85fd1ce6fc433fd6a8cd63c5dcc1/Qwen2.5-VL-7B-Instruct-q4_k_m.gguf",
         "name": "Qwen2.5-VL-7B",

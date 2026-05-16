@@ -8,6 +8,7 @@
 #include <sstream>
 #include <cstring>
 #include <cerrno>
+#include <ctime>
 #include <sys/socket.h>
 #include <sys/select.h>
 #include <sys/wait.h>
@@ -252,6 +253,82 @@ static bool http_get_localhost_body(int port, const char* path, std::string* out
     return ok && !out_whole_response->empty();
 }
 
+// Pull the numeric HTTP status off the response status line ("HTTP/1.1 200 OK").
+static int http_status_code(const std::string& response) {
+    size_t line_end = response.find("\r\n");
+    if (line_end == std::string::npos)
+        return -1;
+    const std::string status_line = response.substr(0, line_end);
+    size_t sp = status_line.find(' ');
+    if (sp == std::string::npos)
+        return -1;
+    try {
+        return std::stoi(status_line.substr(sp + 1, 3));
+    } catch (...) {
+        return -1;
+    }
+}
+
+static std::string http_response_body(const std::string& response) {
+    size_t hdr = response.find("\r\n\r\n");
+    return hdr == std::string::npos ? std::string() : response.substr(hdr + 4);
+}
+
+// Blocking localhost HTTP request. method "GET"/"POST"; body empty for GET.
+// Returns true if a response was received; *status/*body are filled in.
+static bool http_request_localhost(int port, const char* method, const char* path,
+                                    const std::string& body, int timeout_ms,
+                                    int* status, std::string* out_body) {
+    std::ostringstream req;
+    req << method << " " << path << " HTTP/1.1\r\n"
+        << "Host: 127.0.0.1\r\n";
+    if (!body.empty()) {
+        req << "Content-Type: application/json\r\n"
+            << "Content-Length: " << body.size() << "\r\n";
+    }
+    req << "Connection: close\r\n\r\n";
+    if (!body.empty())
+        req << body;
+    std::string request = req.str();
+
+    int sock = socket(AF_INET, SOCK_STREAM, 0);
+    if (sock < 0)
+        return false;
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(static_cast<uint16_t>(port));
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    struct timeval tv;
+    tv.tv_sec  = timeout_ms / 1000;
+    tv.tv_usec = (timeout_ms % 1000) * 1000;
+    setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
+    bool ok = connect(sock, (struct sockaddr*)&addr, sizeof(addr)) == 0;
+    std::string whole;
+    if (ok) {
+        ssize_t nw = ::send(sock, request.data(), request.size(), 0);
+        ok = nw == static_cast<ssize_t>(request.size());
+        if (ok) {
+            char buf[8192];
+            ssize_t nr;
+            while ((nr = recv(sock, buf, sizeof(buf) - 1, 0)) > 0) {
+                buf[nr] = '\0';
+                whole += buf;
+                if (whole.size() > 4 * 1024 * 1024)
+                    break;
+            }
+        }
+    }
+    close(sock);
+    if (!ok || whole.empty())
+        return false;
+    if (status)   *status = http_status_code(whole);
+    if (out_body) *out_body = http_response_body(whole);
+    return true;
+}
+
 /** Parse llamacpp: lines from Prometheus text (see ggml-org llama.cpp server metrics route) */
 static void apply_prometheus_plaintext(ServerInstance* inst, const std::string& body) {
     uint64_t prompt_tot = 0, gen_tot = 0;
@@ -326,37 +403,63 @@ void ServerInstance::poll_health() {
     while (!stop_threads && is_running.load(std::memory_order_relaxed)) {
         const int port = config.port;
 
-        std::string raw;
-        if (http_get_localhost_body(port, "/health", &raw)) {
-            std::string body;
-            if (extract_http_body_if_ok(raw, &body)) {
-                try {
-                    json j = json::parse(body);
+        // --- /health (timed) drives the passive health badge ---
+        int    h_status = -1;
+        std::string h_body;
+        const auto t0 = std::chrono::steady_clock::now();
+        const bool h_ok = http_request_localhost(port, "GET", "/health", "",
+                                                  1500, &h_status, &h_body);
+        const double h_ms = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - t0).count();
 
-                    if (j.contains("slots_idle")) {
-                        const int idle = j["slots_idle"].get<int>();
-                        const int processing =
-                            j.contains("slots_processing") ? j["slots_processing"].get<int>() : 0;
-                        n_slots = idle + processing;
-                        active_slots = processing;
-                    }
-
-                    if (j.contains("requests_processed")) {
-                        completed_requests.store(
-                            static_cast<uint64_t>(j["requests_processed"].get<uint64_t>()),
-                            std::memory_order_relaxed);
-                    }
-                    if (j.contains("tokens_processed")) {
-                        total_tokens_processed.store(
-                            static_cast<uint64_t>(j["tokens_processed"].get<uint64_t>()),
-                            std::memory_order_relaxed);
-                    }
-                } catch (...) {
-                    // minimal /health body (e.g. {"status":"ok"}) — expected
-                }
+        if (h_ok && h_status == 200) {
+            last_health_latency_ms.store(h_ms, std::memory_order_relaxed);
+            last_health_ok_epoch.store((long)::time(nullptr), std::memory_order_relaxed);
+            health_fail_streak.store(0, std::memory_order_relaxed);
+            HealthState st = !model_loaded.load(std::memory_order_relaxed)
+                                 ? HealthState::Loading
+                                 : (h_ms > 2500.0 ? HealthState::Degraded
+                                                  : HealthState::Healthy);
+            health_state.store((int)st, std::memory_order_relaxed);
+        } else {
+            const int streak = health_fail_streak.fetch_add(1, std::memory_order_relaxed) + 1;
+            // llama-server returns 503 while the model is still loading.
+            if (h_ok && h_status == 503 && !model_loaded.load(std::memory_order_relaxed)) {
+                health_state.store((int)HealthState::Loading, std::memory_order_relaxed);
+                health_fail_streak.store(0, std::memory_order_relaxed);
+            } else if (streak >= 2) {
+                health_state.store((int)HealthState::Down, std::memory_order_relaxed);
             }
         }
 
+        if (h_ok && h_status == 200) {
+            try {
+                json j = json::parse(h_body);
+
+                if (j.contains("slots_idle")) {
+                    const int idle = j["slots_idle"].get<int>();
+                    const int processing =
+                        j.contains("slots_processing") ? j["slots_processing"].get<int>() : 0;
+                    n_slots = idle + processing;
+                    active_slots = processing;
+                }
+
+                if (j.contains("requests_processed")) {
+                    completed_requests.store(
+                        static_cast<uint64_t>(j["requests_processed"].get<uint64_t>()),
+                        std::memory_order_relaxed);
+                }
+                if (j.contains("tokens_processed")) {
+                    total_tokens_processed.store(
+                        static_cast<uint64_t>(j["tokens_processed"].get<uint64_t>()),
+                        std::memory_order_relaxed);
+                }
+            } catch (...) {
+                // minimal /health body (e.g. {"status":"ok"}) — expected
+            }
+        }
+
+        std::string raw;
         if (http_get_localhost_body(port, "/slots", &raw)) {
             std::string body;
             if (extract_http_body_if_ok(raw, &body)) {
@@ -388,6 +491,165 @@ void ServerInstance::poll_health() {
         for (int i = 0; i < 40 && !stop_threads && is_running.load(std::memory_order_relaxed); ++i)
             std::this_thread::sleep_for(std::chrono::milliseconds(50));
     }
+}
+
+// -------------------------------------------------------
+//  Active functional probe (on-demand real request)
+// -------------------------------------------------------
+
+// 24x24 solid-red PNG, base64 — sent for the vision sanity check.
+static const char* kProbeImageB64 =
+    "iVBORw0KGgoAAAANSUhEUgAAABgAAAAYCAIAAABvFaqvAAAAH0lEQVR42mN4oKBAFcQwa"
+    "tCoQaMGjRo0atCoQQNvEACY3YgfSlox4wAAAABJRU5ErkJggg==";
+
+bool ServerInstance::has_mmproj() const {
+    return config.custom_args.find("mmproj") != std::string::npos;
+}
+
+// Try to pull assistant text out of either an OpenAI-style or a native
+// llama.cpp completion response. Returns "" if nothing usable.
+static std::string extract_reply_text(const std::string& body) {
+    try {
+        json j = json::parse(body);
+        if (j.contains("choices") && j["choices"].is_array() && !j["choices"].empty()) {
+            const auto& c0 = j["choices"][0];
+            if (c0.contains("message") && c0["message"].contains("content"))
+                return c0["message"]["content"].get<std::string>();
+            if (c0.contains("text"))
+                return c0["text"].get<std::string>();
+        }
+        if (j.contains("content"))
+            return j["content"].get<std::string>();
+    } catch (...) {}
+    return std::string();
+}
+
+void ServerInstance::run_probe(bool vision) {
+    if (probe_in_flight.exchange(true))
+        return;                                  // one at a time
+    if (probe_thread.joinable())
+        probe_thread.join();                     // reap the previous (finished) run
+
+    {
+        std::lock_guard<std::mutex> lk(probe_mutex);
+        probe_result_.state   = ProbeState::Running;
+        probe_result_.vision  = vision;
+        probe_result_.summary = vision ? "Sending a test image to the model..."
+                                       : "Sending a test request to the model...";
+        probe_result_.detail.clear();
+        probe_result_.latency_ms = 0.0;
+    }
+
+    probe_thread = std::thread([this, vision]() {
+        const int port = config.port;
+
+        // Build an OpenAI-compatible chat request. For vision, attach the
+        // embedded image as a data URI alongside the question.
+        json req;
+        req["model"]       = "llamaflow-probe";
+        req["max_tokens"]  = vision ? 24 : 8;
+        req["temperature"] = 0.0;
+        json msg;
+        msg["role"] = "user";
+        if (vision) {
+            json parts = json::array();
+            json txt; txt["type"] = "text";
+            txt["text"] = "What is the main color of this image? Answer with one word.";
+            json img; img["type"] = "image_url";
+            img["image_url"]["url"] =
+                std::string("data:image/png;base64,") + kProbeImageB64;
+            parts.push_back(txt);
+            parts.push_back(img);
+            msg["content"] = parts;
+        } else {
+            msg["content"] = "Reply with exactly one word: pong";
+        }
+        req["messages"] = json::array({msg});
+        const std::string body = req.dump();
+
+        const auto t0 = std::chrono::steady_clock::now();
+        int status = -1;
+        std::string resp;
+        bool got = http_request_localhost(port, "POST", "/v1/chat/completions",
+                                          body, 30000, &status, &resp);
+
+        // Older / minimal builds: fall back to the native completion route
+        // (no image support there, so only for the text probe).
+        if ((!got || status == 404) && !vision) {
+            json nreq;
+            nreq["prompt"]    = "Reply with exactly one word: pong";
+            nreq["n_predict"] = 8;
+            nreq["temperature"] = 0.0;
+            got = http_request_localhost(port, "POST", "/completion",
+                                         nreq.dump(), 30000, &status, &resp);
+        }
+        const double ms = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - t0).count();
+
+        ProbeResult r;
+        r.vision     = vision;
+        r.latency_ms = ms;
+
+        if (!got) {
+            r.state   = ProbeState::Fail;
+            r.summary = "No response — server did not answer the request.";
+            r.detail  = "The connection failed or timed out after "
+                      + std::to_string((int)(ms / 1000)) + "s. The server may be "
+                        "stuck loading, out of memory, or not accepting requests.";
+        } else if (status != 200) {
+            std::string snip = resp.substr(0, 400);
+            r.state   = ProbeState::Fail;
+            r.summary = "Server replied with an error (HTTP "
+                      + std::to_string(status) + ").";
+            r.detail  = snip.empty() ? "Empty error body." : snip;
+        } else {
+            std::string reply = extract_reply_text(resp);
+            // trim whitespace
+            size_t a = reply.find_first_not_of(" \t\r\n");
+            size_t b = reply.find_last_not_of(" \t\r\n");
+            if (a != std::string::npos)
+                reply = reply.substr(a, b - a + 1);
+
+            if (reply.empty()) {
+                r.state   = ProbeState::Fail;
+                r.summary = "Server answered but returned no text.";
+                r.detail  = resp.substr(0, 400);
+            } else {
+                r.state = ProbeState::Pass;
+                if (vision) {
+                    r.summary = "Vision OK — model saw the image and replied in "
+                              + std::to_string((int)ms) + " ms.";
+                } else {
+                    r.summary = "Healthy — model answered in "
+                              + std::to_string((int)ms) + " ms.";
+                }
+                r.detail  = "Model said: \"" + reply.substr(0, 300) + "\"";
+            }
+        }
+
+        const bool passed = (r.state == ProbeState::Pass);
+        const std::string summary = r.summary;
+        {
+            std::lock_guard<std::mutex> lk(probe_mutex);
+            probe_result_ = std::move(r);
+        }
+        {
+            std::lock_guard<std::mutex> lg(log_mutex);
+            LogEntry e;
+            e.level   = passed ? "INFO" : "ERROR";
+            e.color   = passed ? ImVec4(0.2f, 1.0f, 0.4f, 1.0f)
+                               : ImVec4(1.0f, 0.3f, 0.3f, 1.0f);
+            e.message = std::string("[probe] ")
+                      + (vision ? "vision test: " : "request test: ")
+                      + summary;
+            logs.push_back(e);
+            if (e.level == "ERROR") {
+                recent_issues.push_back(e);
+                while (recent_issues.size() > 50) recent_issues.pop_front();
+            }
+        }
+        probe_in_flight.store(false);
+    });
 }
 
 // -------------------------------------------------------
@@ -633,6 +895,9 @@ void ServerInstance::stop() {
             log_thread.join();
         if (health_thread.joinable())
             health_thread.join();
+        if (probe_thread.joinable())
+            probe_thread.join();
+        health_state.store((int)HealthState::Stopped, std::memory_order_relaxed);
         shutdown_phase.store(PHASE_NONE, std::memory_order_release);
         return;
     }
@@ -668,6 +933,9 @@ void ServerInstance::stop() {
         log_thread.join();
     if (health_thread.joinable())
         health_thread.join();
+    if (probe_thread.joinable())
+        probe_thread.join();
+    health_state.store((int)HealthState::Stopped, std::memory_order_relaxed);
 
     shutdown_phase.store(PHASE_NONE, std::memory_order_release);
 }
@@ -893,11 +1161,19 @@ void ServerInstance::tail_logs() {
 
                             // If it's a progress update, replace the last line to avoid spam
                             if (c == '\r' && !logs.empty() && (logs.back().message.find("...") != std::string::npos || logs.back().message.find("progress") != std::string::npos)) {
-                                logs.back() = parse_log_line(current_line); 
+                                logs.back() = parse_log_line(current_line);
                             } else {
-                                logs.push_back(parse_log_line(current_line));
+                                LogEntry le = parse_log_line(current_line);
+                                // Mirror real problems into the Issues panel so
+                                // the user never has to dig through the terminal.
+                                if (le.level == "ERROR" || le.level == "WARN") {
+                                    recent_issues.push_back(le);
+                                    while (recent_issues.size() > 50)
+                                        recent_issues.pop_front();
+                                }
+                                logs.push_back(std::move(le));
                             }
-                            
+
                             if (logs.size() > 100000) logs.pop_front();
                             current_line.clear();
                         }

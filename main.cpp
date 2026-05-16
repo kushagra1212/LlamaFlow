@@ -451,6 +451,189 @@ static void UiDrawServerLogViewport(ServerInstance* srv) {
     UiDrawLogTable(srv, state);
 }
 
+// ============================================================
+//  UI: Health banner + functional test + Issues panel
+//  Goal: tell the user in one glance whether the server is OK,
+//  whether it actually answers requests, and surface real
+//  errors without making them read the verbose terminal.
+// ============================================================
+static void UiDrawHealthPanel(ServerInstance* srv, const ServerMetrics& sm, bool is_stopping) {
+    HealthState hs = (HealthState)srv->health_state.load(std::memory_order_relaxed);
+    if (is_stopping) hs = HealthState::Stopped;
+
+    const double hms  = srv->last_health_latency_ms.load(std::memory_order_relaxed);
+    const int    fails = srv->health_fail_streak.load(std::memory_order_relaxed);
+
+    // --- Plain-English "what is it doing right now" sentence ---
+    char activity[192];
+    if (is_stopping) {
+        snprintf(activity, sizeof activity, "Shutting the server down...");
+    } else if (!sm.model_loaded) {
+        snprintf(activity, sizeof activity,
+                 "Loading the model into memory... %d%%", (int)(sm.current_progress * 100));
+    } else if (sm.context_processing) {
+        if (sm.context_total > 0)
+            snprintf(activity, sizeof activity,
+                     "Reading your prompt... (%llu tokens, %d%%)",
+                     (unsigned long long)sm.context_total, (int)(sm.context_progress * 100));
+        else
+            snprintf(activity, sizeof activity, "Reading your prompt...");
+    } else if (sm.active_slots > 0 && sm.eval_tps > 0.5f) {
+        snprintf(activity, sizeof activity,
+                 "Generating a response... (%.0f tokens/sec)", sm.eval_tps);
+    } else if (sm.active_slots > 0) {
+        snprintf(activity, sizeof activity, "Handling %d request%s right now...",
+                 sm.active_slots, sm.active_slots == 1 ? "" : "s");
+    } else {
+        snprintf(activity, sizeof activity, "Idle - ready and waiting for requests.");
+    }
+
+    // --- Map health state to a word, colors and a one-line explanation ---
+    const char* word = "STARTING";
+    ImVec4 accent(0.70f, 0.80f, 0.90f, 1.0f);
+    ImVec4 bg(0.16f, 0.20f, 0.26f, 1.0f);
+    std::string sub = "Waiting for the server to come up...";
+    switch (hs) {
+        case HealthState::Healthy:
+            word = "HEALTHY";
+            accent = ImVec4(0.25f, 0.95f, 0.45f, 1.0f);
+            bg     = ImVec4(0.09f, 0.24f, 0.14f, 1.0f);
+            sub = std::string(activity) + "   (health check OK in "
+                + std::to_string((int)hms) + " ms)";
+            break;
+        case HealthState::Loading:
+            word = "LOADING";
+            accent = ImVec4(1.0f, 0.78f, 0.25f, 1.0f);
+            bg     = ImVec4(0.27f, 0.21f, 0.06f, 1.0f);
+            sub = activity;
+            break;
+        case HealthState::Degraded:
+            word = "SLOW";
+            accent = ImVec4(1.0f, 0.60f, 0.20f, 1.0f);
+            bg     = ImVec4(0.30f, 0.17f, 0.05f, 1.0f);
+            sub = "Responding, but slowly (" + std::to_string((int)hms)
+                + " ms health check) - heavy load or low memory. " + activity;
+            break;
+        case HealthState::Down:
+            word = "NOT RESPONDING";
+            accent = ImVec4(1.0f, 0.32f, 0.32f, 1.0f);
+            bg     = ImVec4(0.32f, 0.10f, 0.10f, 1.0f);
+            sub = "Port " + std::to_string(srv->config.port)
+                + " is not answering health checks (" + std::to_string(fails)
+                + " failed in a row). It may be stuck loading, crashed, or out of "
+                  "memory - check Issues below.";
+            break;
+        case HealthState::Stopped:
+            word = "STOPPED";
+            accent = ImVec4(0.60f, 0.60f, 0.60f, 1.0f);
+            bg     = ImVec4(0.17f, 0.17f, 0.17f, 1.0f);
+            sub = "Server is shutting down or has stopped.";
+            break;
+        default: break; // Unknown -> STARTING (defaults above)
+    }
+
+    // --- Banner ---
+    const float line_h = ImGui::GetTextLineHeightWithSpacing();
+    ImGui::PushStyleColor(ImGuiCol_ChildBg, bg);
+    ImGui::BeginChild("##healthbanner", ImVec2(0, line_h * 4.0f + 12.0f), true,
+                      ImGuiWindowFlags_NoScrollbar);
+    {
+        ImDrawList* dl = ImGui::GetWindowDrawList();
+        ImVec2 p0 = ImGui::GetWindowPos();
+        dl->AddRectFilled(p0, ImVec2(p0.x + ImGui::GetWindowWidth(), p0.y + 4),
+                          ImColor(accent));
+        ImGui::Spacing();
+        ImGui::TextColored(accent, "\xe2\x97\x8f  %s", word);
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.88f, 0.90f, 0.92f, 1.0f));
+        ImGui::TextWrapped("%s", sub.c_str());
+        ImGui::PopStyleColor();
+    }
+    ImGui::EndChild();
+    ImGui::PopStyleColor();
+
+    ImGui::Spacing();
+
+    // --- Functional test (real request) ---
+    const bool can_test = sm.model_loaded && !is_stopping
+                       && !srv->probe_in_flight.load(std::memory_order_relaxed);
+    if (!can_test) ImGui::BeginDisabled();
+    if (ImGui::Button("Test Server")) {
+        srv->run_probe(false);
+        ToastPush(ToastKind::Info, "Sent a test request to the server...");
+    }
+    if (ImGui::IsItemHovered() && ImGui::BeginTooltip()) {
+        ImGui::TextUnformatted("Sends one real request and checks the model actually replies.");
+        ImGui::EndTooltip();
+    }
+    if (srv->has_mmproj()) {
+        ImGui::SameLine();
+        if (ImGui::Button("Test Vision")) {
+            srv->run_probe(true);
+            ToastPush(ToastKind::Info, "Sent a test image to the vision model...");
+        }
+        if (ImGui::IsItemHovered() && ImGui::BeginTooltip()) {
+            ImGui::TextUnformatted("Sends a small test image and shows what the model sees.");
+            ImGui::EndTooltip();
+        }
+    }
+    if (!can_test) ImGui::EndDisabled();
+
+    ProbeResult pr = srv->probe_result();
+    if (pr.state == ProbeState::Running) {
+        int dots = (int)(ImGui::GetTime() * 2) % 4;
+        ImGui::SameLine();
+        ImGui::TextColored(ImVec4(1.0f, 0.78f, 0.25f, 1.0f), "Testing%.*s",
+                           dots, "...");
+    }
+    if (pr.state == ProbeState::Pass || pr.state == ProbeState::Fail) {
+        const bool ok = pr.state == ProbeState::Pass;
+        ImVec4 c = ok ? ImVec4(0.30f, 0.92f, 0.45f, 1.0f)
+                      : ImVec4(1.0f, 0.36f, 0.36f, 1.0f);
+        ImGui::TextColored(c, "%s %s", ok ? "\xe2\x9c\x94" : "\xe2\x9c\x98",
+                           pr.summary.c_str());
+        if (!pr.detail.empty()) {
+            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.80f, 0.82f, 0.85f, 1.0f));
+            ImGui::TextWrapped("%s", pr.detail.c_str());
+            ImGui::PopStyleColor();
+        }
+    }
+
+    ImGui::Spacing();
+
+    // --- Issues panel: real errors/warnings, lifted out of the noise ---
+    auto issues = srv->get_recent_issues();
+    char hdr[48];
+    snprintf(hdr, sizeof hdr, "Issues (%d)###issues", (int)issues.size());
+    if (!issues.empty())
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 0.55f, 0.40f, 1.0f));
+    bool open = ImGui::CollapsingHeader(hdr, ImGuiTreeNodeFlags_DefaultOpen);
+    if (!issues.empty())
+        ImGui::PopStyleColor();
+    if (open) {
+        if (issues.empty()) {
+            ImGui::TextColored(ImVec4(0.30f, 0.85f, 0.45f, 1.0f),
+                               "No errors or warnings - looking clean.");
+        } else {
+            if (ImGui::SmallButton("Copy issues")) {
+                std::string out;
+                for (const auto& e : issues)
+                    out += "[" + e.level + "] " + e.message + "\n";
+                ImGui::SetClipboardText(out.c_str());
+                ToastPush(ToastKind::Success, "Issues copied to clipboard.");
+            }
+            ImGui::BeginChild("##issuelist", ImVec2(0, line_h * 5.0f), true);
+            if (g_mono_font) ImGui::PushFont(g_mono_font);
+            for (auto it = issues.rbegin(); it != issues.rend(); ++it) {
+                ImGui::PushStyleColor(ImGuiCol_Text, it->color);
+                ImGui::TextWrapped("[%s] %s", it->level.c_str(), it->message.c_str());
+                ImGui::PopStyleColor();
+            }
+            if (g_mono_font) ImGui::PopFont();
+            ImGui::EndChild();
+        }
+    }
+}
+
 static void UiLaunchOverviewTable(const char* id_scope, const LlamaConfig& cfg) {
     ImGui::PushID(id_scope);
     ImGui::Spacing();
@@ -897,6 +1080,13 @@ int main() {
                             ImGui::TextDisabled("| %s",
                                 format_duration(sm.uptime_seconds).c_str());
                         }
+
+                        ImGui::Spacing();
+                        ImGui::Separator();
+                        ImGui::Spacing();
+
+                        // --- At-a-glance health, real request test, Issues ---
+                        UiDrawHealthPanel(srv, sm, is_stopping);
 
                         ImGui::Spacing();
                         ImGui::Separator();
