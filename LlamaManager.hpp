@@ -62,6 +62,13 @@ struct ServerMetrics {
     bool model_loaded = false;
 };
 
+struct LogEntry {
+    std::string timestamp;
+    std::string level;
+    std::string message;
+    ImVec4 color;
+};
+
 class ServerInstance {
 public:
     LlamaConfig config;
@@ -70,7 +77,7 @@ public:
     bool attached = false;               // true = attached to externally-started server (not fork/exec by us)
     /** Set when attaching (or refreshed at stop): PID owning TCP LISTEN on config.port — used to stop external llama-server. */
     pid_t external_listen_pid = -1;
-    std::deque<std::string> logs;
+    std::deque<LogEntry> logs;
     mutable std::mutex log_mutex;        // mutable so get_logs() (const) can lock it
     std::thread log_thread;
     std::thread health_thread;           // HTTP polls /health,/slots,/metrics (spawn + attach modes)
@@ -126,7 +133,7 @@ public:
     float stop_elapsed_seconds() const;
 
     // Thread-safe log access: returns a copy of the log lines under mutex
-    std::deque<std::string> get_logs() const {
+    std::deque<LogEntry> get_logs() const {
         std::lock_guard<std::mutex> lock(log_mutex);
         return logs;
     }
